@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Correlation output data (large generated files)
+correlation_results/
+dirty_image_frames/
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Compiled C objects / shared libs
+*.o
+*.so
+*.dll
+*.pyd
+
+# Logs
+*.log

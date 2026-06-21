@@ -1,0 +1,12 @@
+# OPTIMIZED ANTENNA ARRAY POSITIONS (METERS FROM ARRAY CENTRE)
+# COLUMN 1: X (West-to-East meters from center, positive = East)
+# COLUMN 2: Y (South-to-North meters from center, positive = North)
+# ------------------------------------------------------------
+0.234401 	0.303694
+5.699686	        -0.951307
+11.872916	1.190113
+-3.330779	4.620976
+-11.683326	7.137174
+-6.792076	-1.604640
+-5.444581	-7.736759
+-6.672026	-12.507893
