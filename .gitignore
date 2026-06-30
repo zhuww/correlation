@@ -10,6 +10,7 @@ build/
 # Correlation output data (large generated files)
 correlation_results/
 dirty_image_frames/
+integrated_images/
 
 # IDE / Editor
 .vscode/
