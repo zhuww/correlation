@@ -41,7 +41,8 @@ from collections import OrderedDict
 from make_dirty_image import (make_dirty_image_cpu,
                                load_optimized_antennas,
                                get_polar_grid_metadata,
-                               compute_uvw_from_antennas)
+                               compute_uv_tracks,
+                               read_frequency_range_from_data)
 
 
 # ==============================================================================
@@ -462,7 +463,6 @@ class RealtimeDirtyImageApp:
     def _create_uv_coverage_subplot(self):
         """UV 覆盖图：显示当前频率下所有 28 条基线的 (u,v) 采样"""
         self.ax_uv = self.fig.add_subplot(1, 3, 3, facecolor='#0d1b2a')
-        self.ax_uv.set_title("UV Coverage (baselines)", color='white', fontsize=11)
         self.ax_uv.set_xlabel("u (λ)", color='white')
         self.ax_uv.set_ylabel("v (λ)", color='white')
         self.ax_uv.tick_params(colors='white', labelsize=7)
@@ -472,49 +472,92 @@ class RealtimeDirtyImageApp:
         self._draw_uv_coverage()
 
     def _draw_uv_coverage(self):
-        """计算并绘制 UV 覆盖"""
-        wavelength = 299.792458 / self.freq_mhz
-        bu, bv, bw = compute_uvw_from_antennas(
-            self.antennas, wavelength,
-            hour_angle_deg=0.0, declination_deg=90.0
+        """计算并绘制宽带 UV 覆盖（频率相关的 uv 轨迹线）"""
+        flo, fhi = read_frequency_range_from_data(
+            str(self.watch_dir), center_freq_mhz=self.freq_mhz
+        )
+        if flo is None:
+            flo = self.freq_mhz - 50.0
+            fhi = self.freq_mhz + 50.0
+
+        uv_lines, freq_samples, uv_center = compute_uv_tracks(
+            self.antennas, freq_low_mhz=flo, freq_high_mhz=fhi,
+            n_samples=20
         )
 
-        # 清理旧数据
         for artist in getattr(self, '_uv_artists', []):
             try:
                 artist.remove()
             except Exception:
                 pass
-
         self._uv_artists = []
 
-        s1 = self.ax_uv.scatter(bu, bv, c='cyan', s=30, marker='o',
-                                edgecolors='white', linewidths=0.5,
-                                zorder=5, alpha=0.9)
-        s2 = self.ax_uv.scatter(-bu, -bv, c='magenta', s=20, marker='s',
-                                edgecolors='white', linewidths=0.3,
-                                zorder=4, alpha=0.5)
+        n_baselines = uv_lines.shape[0]
+        cmap = plt.cm.plasma
+
+        for bl_idx in range(n_baselines):
+            u_track = uv_lines[bl_idx, :, 0]
+            v_track = uv_lines[bl_idx, :, 1]
+            for s in range(len(freq_samples) - 1):
+                t = s / (len(freq_samples) - 1)
+                line = self.ax_uv.plot(
+                    u_track[s:s+2], v_track[s:s+2],
+                    color=cmap(0.2 + 0.6 * t), linewidth=1.2,
+                    alpha=0.7, zorder=3
+                )
+                self._uv_artists.append(line[0])
+            s_low = self.ax_uv.scatter(
+                u_track[0], v_track[0], c=[cmap(0.2)],
+                s=15, marker='o', edgecolors='white',
+                linewidths=0.3, zorder=5, alpha=0.8
+            )
+            self._uv_artists.append(s_low)
+
+        for bl_idx in range(n_baselines):
+            u_track = -uv_lines[bl_idx, :, 0]
+            v_track = -uv_lines[bl_idx, :, 1]
+            line = self.ax_uv.plot(
+                u_track, v_track,
+                color='gray', linewidth=0.6, alpha=0.3,
+                linestyle='--', zorder=2
+            )
+            self._uv_artists.append(line[0])
+
+        s_center = self.ax_uv.scatter(
+            uv_center[:, 0], uv_center[:, 1],
+            c='cyan', s=12, marker='D', edgecolors='white',
+            linewidths=0.3, zorder=6, alpha=0.9
+        )
+        self._uv_artists.append(s_center)
 
         self.ax_uv.axhline(y=0, color='#336699', linewidth=0.5, alpha=0.5)
         self.ax_uv.axvline(x=0, color='#336699', linewidth=0.5, alpha=0.5)
 
-        uv_max = max(np.max(np.abs(bu)), np.max(np.abs(bv))) * 1.2
+        uv_all = np.vstack([uv_lines[:, 0, :], uv_lines[:, -1, :]])
+        uv_max = max(np.max(np.abs(uv_all[:, 0])),
+                     np.max(np.abs(uv_all[:, 1]))) * 1.15
         if uv_max > 0:
             self.ax_uv.set_xlim(-uv_max, uv_max)
             self.ax_uv.set_ylim(-uv_max, uv_max)
 
         from matplotlib.lines import Line2D
         legend_elements = [
-            Line2D([0], [0], marker='o', color='w', markerfacecolor='cyan',
-                   markersize=7, label='(u,v)'),
-            Line2D([0], [0], marker='s', color='w', markerfacecolor='magenta',
-                   markersize=6, label='(−u,−v)'),
+            Line2D([0], [0], color=cmap(0.5), linewidth=1.5,
+                   label=f'uv track ({flo:.0f}–{fhi:.0f} MHz)'),
+            Line2D([0], [0], marker='D', color='w', markerfacecolor='cyan',
+                   markersize=6, label=f'{self.freq_mhz:.0f} MHz center'),
+            Line2D([0], [0], linestyle='--', color='gray', linewidth=1,
+                   label='(−u,−v) conjugate'),
         ]
         leg = self.ax_uv.legend(handles=legend_elements, loc='upper right',
-                                fontsize=6, facecolor='#16213e',
+                                fontsize=5.5, facecolor='#16213e',
                                 edgecolor='#336699', labelcolor='white')
+        self._uv_artists.append(leg)
 
-        self._uv_artists.extend([s1, s2, leg])
+        self.ax_uv.set_title(
+            f"UV Coverage (28 baselines, {flo:.0f}–{fhi:.0f} MHz)",
+            color='white', fontsize=10
+        )
 
     def _create_statusbar(self):
         status_frame = ttk.Frame(self.root)

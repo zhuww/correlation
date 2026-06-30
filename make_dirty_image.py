@@ -1,4 +1,5 @@
 import numpy as np
+from pathlib import Path
 
 # ==============================================================================
 # ASTROPHYSICAL CONTEXT & PROJECT CONTEXT NOTE
@@ -963,3 +964,98 @@ def get_polar_grid_metadata(grid_pts=256, n_radial=None, n_azimuthal=None):
         'az_deg': az_deg,
         'is_allsky': True,
     }
+
+
+def compute_uv_tracks(antennas, freq_low_mhz=100.0, freq_high_mhz=200.0,
+                      n_samples=20, hour_angle_deg=0.0, declination_deg=90.0):
+    """
+    Compute broadband UV tracks for all 28 baselines across a frequency range.
+
+    For each baseline (i,j), the (u,v) coordinates scale linearly with frequency:
+        u(f) = baseline_x * f / c
+        v(f) = baseline_y * f / c
+
+    This function samples the frequency range and returns UV coordinate arrays
+    suitable for drawing line segments showing the full frequency-dependent
+    uv coverage.
+
+    Parameters
+    ----------
+    antennas : ndarray, shape (8, 2)
+        Antenna (x, y) positions in meters.
+    freq_low_mhz, freq_high_mhz : float
+        Frequency range in MHz (e.g. 100-200 MHz).
+    n_samples : int
+        Number of frequency samples (endpoints are always included).
+    hour_angle_deg : float
+        Hour angle in degrees.
+    declination_deg : float
+        Declination in degrees.
+
+    Returns
+    -------
+    uv_lines : ndarray, shape (n_baselines, n_samples, 2)
+        (u, v) coordinates for each baseline at each frequency sample.
+        n_baselines = 28 (all unique pairs of 8 antennas).
+    freq_samples_mhz : ndarray, shape (n_samples,)
+        Sampled frequencies in MHz.
+    uv_center : ndarray, shape (28, 2)
+        (u, v) at the center frequency (mid-point), for reference markers.
+    """
+    n_ant = antennas.shape[0]
+    freq_samples = np.linspace(freq_low_mhz, freq_high_mhz, n_samples)
+
+    # Compute (u,v) at each frequency for all 28 baselines
+    n_baselines = n_ant * (n_ant - 1) // 2
+    uv_lines = np.zeros((n_baselines, n_samples, 2))
+
+    for k, f_mhz in enumerate(freq_samples):
+        wavelength = 299.792458 / f_mhz
+        bu, bv, _ = compute_uvw_from_antennas(
+            antennas, wavelength,
+            hour_angle_deg=hour_angle_deg,
+            declination_deg=declination_deg
+        )
+        uv_lines[:, k, 0] = bu
+        uv_lines[:, k, 1] = bv
+
+    # Center-frequency uv for markers
+    freq_center = (freq_low_mhz + freq_high_mhz) / 2.0
+    wavelength_center = 299.792458 / freq_center
+    bu_c, bv_c, _ = compute_uvw_from_antennas(
+        antennas, wavelength_center,
+        hour_angle_deg=hour_angle_deg,
+        declination_deg=declination_deg
+    )
+    uv_center = np.column_stack([bu_c, bv_c])
+
+    return uv_lines, freq_samples, uv_center
+
+
+def read_frequency_range_from_data(data_dir, center_freq_mhz=150.0):
+    """
+    Read actual frequency bins from a sample CSV file in data_dir.
+
+    CSV files contain a 'frequency_hz' column with baseband frequencies.
+    The actual sky frequency is center_freq_mhz + frequency_hz/1e6.
+
+    Returns
+    -------
+    (freq_low_sky_mhz, freq_high_sky_mhz) or (None, None) if no data found.
+    """
+    data_dir = Path(data_dir)
+    csv_files = sorted(data_dir.glob("correlation_*.csv"))
+    if not csv_files:
+        return None, None
+
+    try:
+        import pandas as pd
+        df = pd.read_csv(csv_files[0], comment='#', nrows=5000)
+        if 'frequency_hz' in df.columns:
+            f_base = df['frequency_hz'].values
+            # Real frequency = center + baseband offset
+            f_sky = center_freq_mhz + f_base / 1e6
+            return float(np.min(f_sky)), float(np.max(f_sky))
+    except Exception:
+        pass
+    return None, None

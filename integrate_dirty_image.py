@@ -51,6 +51,8 @@ from make_dirty_image import (
     make_dirty_image_polar_cpu,
     load_optimized_antennas,
     compute_uvw_from_antennas,
+    compute_uv_tracks,
+    read_frequency_range_from_data,
     get_polar_grid_metadata,
     reject_rfi_visibilities,
     _extract_visibility_data,
@@ -542,7 +544,8 @@ def save_integrated_image(dirty_img, date_str, method, imaging_mode,
 
     # ── UV 覆盖 + 天线布局子图 ──
     if has_uv:
-        _draw_uv_coverage_subplot(ax_uv, antennas, freq_mhz)
+        _draw_uv_coverage_subplot(ax_uv, antennas, freq_mhz,
+                                  data_dir=output_dir.parent / "correlation_results")
         _draw_antenna_layout_subplot(ax_ant, antennas)
     else:
         fig.tight_layout(pad=2.0)
@@ -562,44 +565,89 @@ def save_integrated_image(dirty_img, date_str, method, imaging_mode,
     return png_path, npy_path
 
 
-def _draw_uv_coverage_subplot(ax_uv, antennas, freq_mhz):
-    """在指定轴上绘制 UV 覆盖图"""
-    wavelength = 299.792458 / freq_mhz
-    bu, bv, bw = compute_uvw_from_antennas(
-        antennas, wavelength,
-        hour_angle_deg=0.0, declination_deg=90.0
+def _draw_uv_coverage_subplot(ax_uv, antennas, freq_mhz, data_dir=None):
+    """在指定轴上绘制宽带 UV 覆盖图（频率相关的 uv 轨迹线）"""
+    # 读取实际频率范围
+    flo, fhi = None, None
+    if data_dir is not None:
+        flo, fhi = read_frequency_range_from_data(
+            str(data_dir), center_freq_mhz=freq_mhz
+        )
+    if flo is None:
+        flo = freq_mhz - 50.0
+        fhi = freq_mhz + 50.0
+
+    uv_lines, freq_samples, uv_center = compute_uv_tracks(
+        antennas, freq_low_mhz=flo, freq_high_mhz=fhi,
+        n_samples=20
     )
 
-    ax_uv.set_title("UV Coverage (baselines)", color='white', fontsize=10)
     ax_uv.set_xlabel("u (λ)", color='white')
     ax_uv.set_ylabel("v (λ)", color='white')
     ax_uv.tick_params(colors='white', labelsize=7)
     ax_uv.set_aspect('equal')
     ax_uv.grid(True, alpha=0.25, color='gray', linestyle=':')
 
-    ax_uv.scatter(bu, bv, c='cyan', s=25, marker='o',
-                  edgecolors='white', linewidths=0.5, zorder=5, alpha=0.9)
-    ax_uv.scatter(-bu, -bv, c='magenta', s=16, marker='s',
-                  edgecolors='white', linewidths=0.3, zorder=4, alpha=0.5)
+    n_baselines = uv_lines.shape[0]
+    cmap = plt.cm.plasma
+
+    for bl_idx in range(n_baselines):
+        u_track = uv_lines[bl_idx, :, 0]
+        v_track = uv_lines[bl_idx, :, 1]
+        for s in range(len(freq_samples) - 1):
+            t = s / (len(freq_samples) - 1)
+            ax_uv.plot(
+                u_track[s:s+2], v_track[s:s+2],
+                color=cmap(0.2 + 0.6 * t), linewidth=1.2,
+                alpha=0.7, zorder=3
+            )
+        ax_uv.scatter(
+            u_track[0], v_track[0], c=[cmap(0.2)],
+            s=15, marker='o', edgecolors='white',
+            linewidths=0.3, zorder=5, alpha=0.8
+        )
+
+    for bl_idx in range(n_baselines):
+        u_track = -uv_lines[bl_idx, :, 0]
+        v_track = -uv_lines[bl_idx, :, 1]
+        ax_uv.plot(
+            u_track, v_track,
+            color='gray', linewidth=0.6, alpha=0.3,
+            linestyle='--', zorder=2
+        )
+
+    ax_uv.scatter(
+        uv_center[:, 0], uv_center[:, 1],
+        c='cyan', s=12, marker='D', edgecolors='white',
+        linewidths=0.3, zorder=6, alpha=0.9
+    )
 
     ax_uv.axhline(y=0, color='#336699', linewidth=0.5, alpha=0.5)
     ax_uv.axvline(x=0, color='#336699', linewidth=0.5, alpha=0.5)
 
-    uv_max = max(np.max(np.abs(bu)), np.max(np.abs(bv))) * 1.2
+    uv_max = max(np.max(np.abs(uv_lines[:, 0, :])),
+                 np.max(np.abs(uv_lines[:, -1, :]))) * 1.15
     if uv_max > 0:
         ax_uv.set_xlim(-uv_max, uv_max)
         ax_uv.set_ylim(-uv_max, uv_max)
 
     from matplotlib.lines import Line2D
     legend_elements = [
-        Line2D([0], [0], marker='o', color='w', markerfacecolor='cyan',
-               markersize=6, label='(u,v)'),
-        Line2D([0], [0], marker='s', color='w', markerfacecolor='magenta',
-               markersize=5, label='(−u,−v)'),
+        Line2D([0], [0], color=cmap(0.5), linewidth=1.5,
+               label=f'uv track ({flo:.0f}–{fhi:.0f} MHz)'),
+        Line2D([0], [0], marker='D', color='w', markerfacecolor='cyan',
+               markersize=6, label=f'{freq_mhz:.0f} MHz center'),
+        Line2D([0], [0], linestyle='--', color='gray', linewidth=1,
+               label='(−u,−v) conjugate'),
     ]
     ax_uv.legend(handles=legend_elements, loc='upper right',
-                 fontsize=6, facecolor='#16213e',
+                 fontsize=5.5, facecolor='#16213e',
                  edgecolor='#336699', labelcolor='white')
+
+    ax_uv.set_title(
+        f"UV Coverage (28 baselines, {flo:.0f}–{fhi:.0f} MHz)",
+        color='white', fontsize=10
+    )
 
 
 def _draw_antenna_layout_subplot(ax_ant, antennas):
