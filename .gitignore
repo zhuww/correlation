@@ -29,5 +29,8 @@ Thumbs.db
 *.dll
 *.pyd
 
+# Antenna coordinates (local config)
+optimized_antenna_coordinates.txt
+
 # Logs
 *.log
