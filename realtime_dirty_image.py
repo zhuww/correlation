@@ -40,7 +40,8 @@ from collections import OrderedDict
 # NOTE: GPU 和 CFFI 相关函数按需延迟导入，确保纯 CPU 模式无需 CuPy/cffi 即可运行
 from make_dirty_image import (make_dirty_image_cpu,
                                load_optimized_antennas,
-                               get_polar_grid_metadata)
+                               get_polar_grid_metadata,
+                               compute_uvw_from_antennas)
 
 
 # ==============================================================================
@@ -191,7 +192,7 @@ class RealtimeDirtyImageApp:
         # ========================
         self.root = tk.Tk()
         self.root.title("Real-Time Dirty Image — 8-Element Radio Array")
-        self.root.geometry("1050x850")
+        self.root.geometry("1350x850")
         self.root.configure(bg='#1a1a2e')
 
         # 菜单栏
@@ -302,15 +303,18 @@ class RealtimeDirtyImageApp:
 
     def _create_plot_area(self):
         """根据成像模式创建对应的绘图区"""
-        self.fig = Figure(figsize=(11, 8), facecolor='#1a1a2e')
+        self.fig = Figure(figsize=(14, 8), facecolor='#1a1a2e')
 
         if self.imaging_mode in ("gpu", "polar_cpu"):
             self._create_polar_plot_area()
         else:
             self._create_cartesian_plot_area()
 
-        # 天线布局图（右小图）—— 两种模式共用
+        # 天线布局图 —— 两种模式共用
         self._create_antenna_subplot()
+
+        # UV 覆盖图
+        self._create_uv_coverage_subplot()
 
         self.fig.tight_layout(pad=2.0)
 
@@ -320,7 +324,7 @@ class RealtimeDirtyImageApp:
 
     def _create_cartesian_plot_area(self):
         """Cartesian (l, m) 波数坐标脏图（CPU 模式，原始工作版本）"""
-        self.ax_dirty = self.fig.add_subplot(1, 2, 1, facecolor='black')
+        self.ax_dirty = self.fig.add_subplot(1, 3, 1, facecolor='black')
         self.ax_dirty.set_title("Dirty Image (l, m)", color='white', fontsize=12)
         self.ax_dirty.set_xlabel("l (East-West)", color='white')
         self.ax_dirty.set_ylabel("m (South-North)", color='white')
@@ -342,7 +346,7 @@ class RealtimeDirtyImageApp:
 
     def _create_polar_plot_area(self):
         """全天极坐标脏图（GPU 模式）"""
-        self.ax_dirty = self.fig.add_subplot(1, 2, 1, facecolor='black')
+        self.ax_dirty = self.fig.add_subplot(1, 3, 1, facecolor='black')
         self.ax_dirty.set_title("All-Sky Dirty Image\nZenith-centred Polar Projection",
                                 color='white', fontsize=12)
         self.ax_dirty.set_xlabel("", color='white')
@@ -432,7 +436,7 @@ class RealtimeDirtyImageApp:
 
     def _create_antenna_subplot(self):
         """天线布局图（右小图）"""
-        self.ax_ant = self.fig.add_subplot(1, 2, 2, facecolor='#16213e')
+        self.ax_ant = self.fig.add_subplot(1, 3, 2, facecolor='#16213e')
         self.ax_ant.set_title("Array Layout", color='white', fontsize=12)
         self.ax_ant.set_xlabel("X (m) East →", color='white')
         self.ax_ant.set_ylabel("Y (m) North →", color='white')
@@ -454,6 +458,63 @@ class RealtimeDirtyImageApp:
         margin = 2.0
         self.ax_ant.set_xlim(xs.min() - margin, xs.max() + margin)
         self.ax_ant.set_ylim(ys.min() - margin, ys.max() + margin)
+
+    def _create_uv_coverage_subplot(self):
+        """UV 覆盖图：显示当前频率下所有 28 条基线的 (u,v) 采样"""
+        self.ax_uv = self.fig.add_subplot(1, 3, 3, facecolor='#0d1b2a')
+        self.ax_uv.set_title("UV Coverage (baselines)", color='white', fontsize=11)
+        self.ax_uv.set_xlabel("u (λ)", color='white')
+        self.ax_uv.set_ylabel("v (λ)", color='white')
+        self.ax_uv.tick_params(colors='white', labelsize=7)
+        self.ax_uv.set_aspect('equal')
+        self.ax_uv.grid(True, alpha=0.25, color='gray', linestyle=':')
+
+        self._draw_uv_coverage()
+
+    def _draw_uv_coverage(self):
+        """计算并绘制 UV 覆盖"""
+        wavelength = 299.792458 / self.freq_mhz
+        bu, bv, bw = compute_uvw_from_antennas(
+            self.antennas, wavelength,
+            hour_angle_deg=0.0, declination_deg=90.0
+        )
+
+        # 清理旧数据
+        for artist in getattr(self, '_uv_artists', []):
+            try:
+                artist.remove()
+            except Exception:
+                pass
+
+        self._uv_artists = []
+
+        s1 = self.ax_uv.scatter(bu, bv, c='cyan', s=30, marker='o',
+                                edgecolors='white', linewidths=0.5,
+                                zorder=5, alpha=0.9)
+        s2 = self.ax_uv.scatter(-bu, -bv, c='magenta', s=20, marker='s',
+                                edgecolors='white', linewidths=0.3,
+                                zorder=4, alpha=0.5)
+
+        self.ax_uv.axhline(y=0, color='#336699', linewidth=0.5, alpha=0.5)
+        self.ax_uv.axvline(x=0, color='#336699', linewidth=0.5, alpha=0.5)
+
+        uv_max = max(np.max(np.abs(bu)), np.max(np.abs(bv))) * 1.2
+        if uv_max > 0:
+            self.ax_uv.set_xlim(-uv_max, uv_max)
+            self.ax_uv.set_ylim(-uv_max, uv_max)
+
+        from matplotlib.lines import Line2D
+        legend_elements = [
+            Line2D([0], [0], marker='o', color='w', markerfacecolor='cyan',
+                   markersize=7, label='(u,v)'),
+            Line2D([0], [0], marker='s', color='w', markerfacecolor='magenta',
+                   markersize=6, label='(−u,−v)'),
+        ]
+        leg = self.ax_uv.legend(handles=legend_elements, loc='upper right',
+                                fontsize=6, facecolor='#16213e',
+                                edgecolor='#336699', labelcolor='white')
+
+        self._uv_artists.extend([s1, s2, leg])
 
     def _create_statusbar(self):
         status_frame = ttk.Frame(self.root)
@@ -499,6 +560,7 @@ class RealtimeDirtyImageApp:
         else:
             self._create_cartesian_plot_area()
         self._create_antenna_subplot()
+        self._create_uv_coverage_subplot()
         self.fig.tight_layout(pad=2.0)
 
         self.im_dirty = None

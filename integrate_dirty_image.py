@@ -403,9 +403,10 @@ def integrate_tracked(frames_by_ts, freq_bin_idx, freq_mhz, grid_pts, fov_deg,
 # ==============================================================================
 def save_integrated_image(dirty_img, date_str, method, imaging_mode,
                           freq_mhz, fov_deg, grid_pts, output_dir,
+                          antennas=None, antennas_file=None,
                           verbose=True):
     """
-    保存积分脏图为 PNG 和 NPY。
+    保存积分脏图为 PNG 和 NPY，附带 UV 覆盖图。
 
     极坐标模式: 鱼眼全天图
     Cartesian 模式: 标准 l/m 投影图
@@ -413,7 +414,29 @@ def save_integrated_image(dirty_img, date_str, method, imaging_mode,
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    fig = plt.figure(figsize=(10, 9), facecolor='#1a1a2e')
+    # 加载天线坐标（如未直接传入）
+    if antennas is None and antennas_file is not None:
+        antennas = load_optimized_antennas(antennas_file)
+
+    has_uv = antennas is not None
+
+    import matplotlib.gridspec as gridspec
+    fig = plt.figure(figsize=(14, 9), facecolor='#1a1a2e',
+                     layout='constrained' if has_uv else None)
+
+    if has_uv:
+        gs = gridspec.GridSpec(2, 2, figure=fig,
+                               height_ratios=[1.6, 1],
+                               hspace=0.35, wspace=0.35)
+        ax_main = fig.add_subplot(gs[0, :], facecolor='black')
+        ax_uv = fig.add_subplot(gs[1, 0], facecolor='#0d1b2a')
+        ax_ant = fig.add_subplot(gs[1, 1], facecolor='#16213e')
+
+    # 选择主绘图轴
+    if has_uv:
+        ax = ax_main
+    else:
+        ax = fig.add_subplot(111, facecolor='black')
 
     if imaging_mode in ("polar_cpu", "gpu"):
         # ── 极坐标全天图 ──
@@ -432,7 +455,8 @@ def save_integrated_image(dirty_img, date_str, method, imaging_mode,
         X_edges = ZETA_E * np.sin(AZ_E)
         Y_edges = ZETA_E * np.cos(AZ_E)
 
-        ax = fig.add_subplot(111, facecolor='black')
+        if not has_uv:
+            ax = fig.add_subplot(111, facecolor='black')
         ax.set_aspect('equal')
 
         # 参考网格
@@ -489,7 +513,8 @@ def save_integrated_image(dirty_img, date_str, method, imaging_mode,
     else:
         # ── Cartesian l/m 图 ──
         l_max = np.sin(np.radians(fov_deg / 2))
-        ax = fig.add_subplot(111, facecolor='black')
+        if not has_uv:
+            ax = fig.add_subplot(111, facecolor='black')
         ax.set_aspect('equal')
 
         valid = dirty_img[dirty_img != 0]
@@ -515,7 +540,12 @@ def save_integrated_image(dirty_img, date_str, method, imaging_mode,
                  f"FOV={fov_deg:.0f}°  |  Grid: {grid_pts}×{grid_pts}")
         ax.set_title(title, color='white', fontsize=13)
 
-    fig.tight_layout(pad=2.0)
+    # ── UV 覆盖 + 天线布局子图 ──
+    if has_uv:
+        _draw_uv_coverage_subplot(ax_uv, antennas, freq_mhz)
+        _draw_antenna_layout_subplot(ax_ant, antennas)
+    else:
+        fig.tight_layout(pad=2.0)
 
     # 保存
     png_path = output_dir / f"integrated_{date_str}_{method}.png"
@@ -530,6 +560,72 @@ def save_integrated_image(dirty_img, date_str, method, imaging_mode,
         print(f"  Saved NPY: {npy_path}")
 
     return png_path, npy_path
+
+
+def _draw_uv_coverage_subplot(ax_uv, antennas, freq_mhz):
+    """在指定轴上绘制 UV 覆盖图"""
+    wavelength = 299.792458 / freq_mhz
+    bu, bv, bw = compute_uvw_from_antennas(
+        antennas, wavelength,
+        hour_angle_deg=0.0, declination_deg=90.0
+    )
+
+    ax_uv.set_title("UV Coverage (baselines)", color='white', fontsize=10)
+    ax_uv.set_xlabel("u (λ)", color='white')
+    ax_uv.set_ylabel("v (λ)", color='white')
+    ax_uv.tick_params(colors='white', labelsize=7)
+    ax_uv.set_aspect('equal')
+    ax_uv.grid(True, alpha=0.25, color='gray', linestyle=':')
+
+    ax_uv.scatter(bu, bv, c='cyan', s=25, marker='o',
+                  edgecolors='white', linewidths=0.5, zorder=5, alpha=0.9)
+    ax_uv.scatter(-bu, -bv, c='magenta', s=16, marker='s',
+                  edgecolors='white', linewidths=0.3, zorder=4, alpha=0.5)
+
+    ax_uv.axhline(y=0, color='#336699', linewidth=0.5, alpha=0.5)
+    ax_uv.axvline(x=0, color='#336699', linewidth=0.5, alpha=0.5)
+
+    uv_max = max(np.max(np.abs(bu)), np.max(np.abs(bv))) * 1.2
+    if uv_max > 0:
+        ax_uv.set_xlim(-uv_max, uv_max)
+        ax_uv.set_ylim(-uv_max, uv_max)
+
+    from matplotlib.lines import Line2D
+    legend_elements = [
+        Line2D([0], [0], marker='o', color='w', markerfacecolor='cyan',
+               markersize=6, label='(u,v)'),
+        Line2D([0], [0], marker='s', color='w', markerfacecolor='magenta',
+               markersize=5, label='(−u,−v)'),
+    ]
+    ax_uv.legend(handles=legend_elements, loc='upper right',
+                 fontsize=6, facecolor='#16213e',
+                 edgecolor='#336699', labelcolor='white')
+
+
+def _draw_antenna_layout_subplot(ax_ant, antennas):
+    """在指定轴上绘制天线布局图"""
+    xs, ys = antennas[:, 0], antennas[:, 1]
+
+    ax_ant.set_title("Array Layout", color='white', fontsize=10)
+    ax_ant.set_xlabel("X (m) East →", color='white')
+    ax_ant.set_ylabel("Y (m) North →", color='white')
+    ax_ant.tick_params(colors='white', labelsize=7)
+    ax_ant.set_aspect('equal')
+    ax_ant.grid(True, alpha=0.3, color='gray')
+
+    ax_ant.scatter(xs, ys, c='cyan', s=60, edgecolors='white', linewidths=1, zorder=5)
+    for i, (x, y) in enumerate(zip(xs, ys)):
+        ax_ant.annotate(f"CH{i+1}", (x, y), textcoords="offset points",
+                         xytext=(5, 5), color='white', fontsize=7)
+
+    for i in range(8):
+        for j in range(i + 1, 8):
+            ax_ant.plot([xs[i], xs[j]], [ys[i], ys[j]],
+                         'gray', alpha=0.25, linewidth=0.5)
+
+    margin = 2.0
+    ax_ant.set_xlim(xs.min() - margin, xs.max() + margin)
+    ax_ant.set_ylim(ys.min() - margin, ys.max() + margin)
 
 
 # ==============================================================================
@@ -636,7 +732,8 @@ def main():
     for method, dirty in results.items():
         save_integrated_image(
             dirty, date_str, method, args.mode,
-            args.freq, args.fov, args.grid, args.output
+            args.freq, args.fov, args.grid, args.output,
+            antennas_file=args.antennas
         )
 
     total_elapsed = time.time() - total_start
