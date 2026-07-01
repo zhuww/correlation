@@ -352,7 +352,8 @@ def _direct_fourier_sum_cpu(L, M, N, baselines_u, baselines_v, baselines_w,
 def make_dirty_image_cpu(antennas_filepath, visibilities,
                           freq_mhz=150.0, grid_pts=256, fov_deg=30.0,
                           apply_w_correction=True, filter_rfi=True,
-                          hour_angle_deg=0.0, declination_deg=90.0):
+                          hour_angle_deg=0.0, declination_deg=90.0,
+                          subtract_baseline=False):
     """
     CPU-only dirty image synthesis via Direct 3D Fourier Integration.
 
@@ -385,11 +386,17 @@ def make_dirty_image_cpu(antennas_filepath, visibilities,
         Hour angle of the phase center in degrees.
     declination_deg : float
         Declination of the phase center in degrees.
+    subtract_baseline : bool
+        If True, compute the baseline dirty image (uniform-sky response) and
+        apply baseline correction: corrected = dirty / baseline - 1.
+        This removes the edge-brightening artifact inherent to wide-field
+        polar imaging, showing only features that exceed the uniform-sky level.
 
     Returns
     -------
     dirty_img : ndarray, shape (grid_pts, grid_pts)
         Reconstructed dirty image in Cartesian (l, m) coordinates.
+        If subtract_baseline=True, returns baseline-corrected image.
     l_axis : ndarray, shape (grid_pts,)
         l-axis values (East-West direction cosine) for plotting.
     m_axis : ndarray, shape (grid_pts,)
@@ -426,6 +433,16 @@ def make_dirty_image_cpu(antennas_filepath, visibilities,
         apply_w_correction,
         horizon_mask
     )
+
+    # 6. Optional baseline correction
+    if subtract_baseline:
+        baseline = _cached_baseline(
+            L, M, N, horizon_mask,
+            baselines_u, baselines_v, baselines_w,
+            apply_w_correction
+        )
+        dirty_img = apply_baseline_correction(dirty_img, baseline,
+                                               method='relative_excess')
 
     return dirty_img, l_axis, m_axis
 
@@ -569,7 +586,7 @@ def make_dirty_image_GPU(antennas_filepath, visibilities,
                           apply_w_correction=True, filter_rfi=True,
                           hour_angle_deg=0.0, declination_deg=90.0,
                           n_radial=None, n_azimuthal=None,
-                          use_gpu=None):
+                          use_gpu=None, subtract_baseline=False):
     """
     All-sky dirty image synthesis via Direct 3D Fourier Integration — GPU path.
 
@@ -620,6 +637,8 @@ def make_dirty_image_GPU(antennas_filepath, visibilities,
         Number of azimuthal bins. If None, derived from grid_pts.
     use_gpu : bool or None
         If True, force GPU; if False, force CPU fallback; if None, auto-detect.
+    subtract_baseline : bool
+        If True, apply baseline correction after GPU/CPU imaging.
 
     Returns
     -------
@@ -689,6 +708,17 @@ def make_dirty_image_GPU(antennas_filepath, visibilities,
             horizon_mask
         )
 
+    # 9. Optional baseline correction (CPU-side, applies to both GPU and CPU results)
+    if subtract_baseline:
+        baseline = _cached_baseline(
+            L, M, N, horizon_mask,
+            baselines_u, baselines_v, baselines_w,
+            apply_w_correction,
+            n_radial=n_radial, n_azimuthal=n_azimuthal
+        )
+        dirty_img = apply_baseline_correction(dirty_img, baseline,
+                                               method='relative_excess')
+
     return dirty_img
 
 
@@ -756,7 +786,7 @@ def make_dirty_image_polar_cpu(antennas_filepath, visibilities,
                                 apply_w_correction=True, filter_rfi=True,
                                 hour_angle_deg=0.0, declination_deg=90.0,
                                 n_radial=None, n_azimuthal=None,
-                                num_threads=0):
+                                num_threads=0, subtract_baseline=False):
     """
     All-sky dirty image synthesis via Direct 3D Fourier Integration — CPU Polar
     engine using C + OpenMP multi-core parallelism.
@@ -801,6 +831,8 @@ def make_dirty_image_polar_cpu(antennas_filepath, visibilities,
         Number of azimuthal bins. If None, derived from grid_pts.
     num_threads : int
         Number of OpenMP threads. 0 = auto (up to 8).
+    subtract_baseline : bool
+        If True, apply baseline correction after imaging.
 
     Returns
     -------
@@ -849,6 +881,7 @@ def make_dirty_image_polar_cpu(antennas_filepath, visibilities,
     vis_re, vis_im, auto_corr_sum = _extract_visibility_data(visibilities)
 
     # 8. Compute dirty image — try CFFI first, fall back to pure Python
+    dirty_img = None
     if use_cffi:
         try:
             from polar_cpu_cffi import polar_fourier_sum, compile_and_load
@@ -862,20 +895,31 @@ def make_dirty_image_polar_cpu(antennas_filepath, visibilities,
                 horizon_mask=horizon_mask,
                 num_threads=num_threads,
             )
-            return dirty_img
         except Exception:
             # CFFI failed at runtime — silently fall back to pure Python
             pass
 
-    # Pure Python fallback (same algorithm, no OpenMP acceleration)
-    dirty_img = _direct_fourier_sum_cpu(
-        L, M, N,
-        baselines_u, baselines_v, baselines_w,
-        vis_re, vis_im,
-        auto_corr_sum,
-        apply_w_correction,
-        horizon_mask
-    )
+    if dirty_img is None:
+        # Pure Python fallback
+        dirty_img = _direct_fourier_sum_cpu(
+            L, M, N,
+            baselines_u, baselines_v, baselines_w,
+            vis_re, vis_im,
+            auto_corr_sum,
+            apply_w_correction,
+            horizon_mask
+        )
+
+    # 9. Optional baseline correction
+    if subtract_baseline:
+        baseline = _cached_baseline(
+            L, M, N, horizon_mask,
+            baselines_u, baselines_v, baselines_w,
+            apply_w_correction,
+            n_radial=n_radial, n_azimuthal=n_azimuthal
+        )
+        dirty_img = apply_baseline_correction(dirty_img, baseline,
+                                               method='relative_excess')
 
     return dirty_img
 
@@ -889,7 +933,7 @@ def make_dirty_image_optimized(antennas_filepath, visibilities,
                                 apply_w_correction=True, filter_rfi=True,
                                 hour_angle_deg=0.0, declination_deg=90.0,
                                 n_radial=None, n_azimuthal=None,
-                                use_gpu=None):
+                                use_gpu=None, subtract_baseline=False):
     """
     Convenience wrapper that auto-selects the appropriate engine.
 
@@ -926,14 +970,15 @@ def make_dirty_image_optimized(antennas_filepath, visibilities,
             apply_w_correction=apply_w_correction, filter_rfi=filter_rfi,
             hour_angle_deg=hour_angle_deg, declination_deg=declination_deg,
             n_radial=n_radial, n_azimuthal=n_azimuthal,
-            use_gpu=True
+            use_gpu=True, subtract_baseline=subtract_baseline
         )
     else:
         return make_dirty_image_cpu(
             antennas_filepath, visibilities,
             freq_mhz=freq_mhz, grid_pts=grid_pts, fov_deg=fov_deg,
             apply_w_correction=apply_w_correction, filter_rfi=filter_rfi,
-            hour_angle_deg=hour_angle_deg, declination_deg=declination_deg
+            hour_angle_deg=hour_angle_deg, declination_deg=declination_deg,
+            subtract_baseline=subtract_baseline
         )
 
 
@@ -1169,7 +1214,8 @@ def make_dirty_image_broadband_cpu(antennas_filepath, file_map,
                                    filter_rfi=True,
                                    hour_angle_deg=0.0, declination_deg=90.0,
                                    n_channels=40, max_bins=4096,
-                                   verbose=True):
+                                   verbose=True,
+                                   subtract_baseline=False):
     """
     Broadband dirty image via multi-frequency direct 3D Fourier integration
     on a Cartesian (l, m) grid.
@@ -1179,6 +1225,12 @@ def make_dirty_image_broadband_cpu(antennas_filepath, file_map,
     frequency-dependent (u,v,w) coordinates and visibilities.
 
     I_broad(l,m) = 1/N Σ_c I_{fc}(l,m)
+
+    Parameters
+    ----------
+    subtract_baseline : bool
+        If True, compute a per-channel baseline dirty image, average, and apply
+        correction: corrected = dirty / baseline_avg - 1.
 
     """
     # 1. Load broadband visibilities
@@ -1204,6 +1256,7 @@ def make_dirty_image_broadband_cpu(antennas_filepath, file_map,
 
     # 4. Integrate over frequency
     dirty = np.zeros((grid_pts, grid_pts), dtype=np.float64)
+    baseline_broad = np.zeros((grid_pts, grid_pts), dtype=np.float64) if subtract_baseline else None
 
     for ci in range(n_channels):
         vis = vis_all[ci]
@@ -1233,7 +1286,22 @@ def make_dirty_image_broadband_cpu(antennas_filepath, file_map,
 
         dirty += channel_dirty
 
+        # Per-channel baseline for broadband correction
+        if subtract_baseline:
+            bl = _cached_baseline(
+                L, M, N, horizon_mask,
+                bu, bv, bw,
+                apply_w_correction
+            )
+            baseline_broad += bl
+
     dirty /= n_channels
+
+    # Apply broadband baseline correction
+    if subtract_baseline:
+        baseline_broad /= n_channels
+        dirty = apply_baseline_correction(dirty, baseline_broad,
+                                           method='relative_excess')
 
     return dirty, l_axis, m_axis, freq_sky_mhz
 
@@ -1247,12 +1315,18 @@ def make_dirty_image_broadband_polar_cpu(antennas_filepath, file_map,
                                          declination_deg=90.0,
                                          n_channels=40, max_bins=4096,
                                          n_radial=None, n_azimuthal=None,
-                                         num_threads=0, verbose=True):
+                                         num_threads=0, verbose=True,
+                                         subtract_baseline=False):
     """
     Broadband all-sky dirty image via multi-frequency direct 3D Fourier
     integration on a polar (zenith, azimuth) grid.
 
     Uses CFFI C module with OpenMP for parallel frequency integration.
+
+    Parameters
+    ----------
+    subtract_baseline : bool
+        If True, compute per-channel baseline and apply broadband correction.
     """
     # 1. Load broadband visibilities
     freq_sky_mhz, vis_all = load_broadband_visibilities(
@@ -1290,6 +1364,7 @@ def make_dirty_image_broadband_polar_cpu(antennas_filepath, file_map,
 
     # 5. Integrate over frequency
     dirty = np.zeros((n_radial, n_azimuthal), dtype=np.float64)
+    baseline_broad = np.zeros((n_radial, n_azimuthal), dtype=np.float64) if subtract_baseline else None
 
     use_cffi = _polar_cpu_available()
 
@@ -1335,9 +1410,329 @@ def make_dirty_image_broadband_polar_cpu(antennas_filepath, file_map,
 
         dirty += channel_dirty
 
+        # Per-channel baseline for broadband correction
+        if subtract_baseline:
+            bl = _cached_baseline(
+                L, M, N, horizon_mask,
+                bu, bv, bw,
+                apply_w_correction,
+                n_radial=n_radial, n_azimuthal=n_azimuthal
+            )
+            baseline_broad += bl
+
     dirty /= n_channels
 
+    # Apply broadband baseline correction
+    if subtract_baseline:
+        baseline_broad /= n_channels
+        dirty = apply_baseline_correction(dirty, baseline_broad,
+                                           method='relative_excess')
+
     return dirty, freq_sky_mhz
+
+
+# ==============================================================================
+# Flat-field / Baseline Correction — 均匀天空响应去除
+# ==============================================================================
+# 180° 视场下, w-修正中的 1/n 因子在地平线附近 (n→0) 发散, 加上稀疏
+# uv采样和 w-term 相位累积, 即使对完全均匀的天空亮度分布, 重建脏图也会
+# 在视场边缘出现强烈的信号增强。这里计算"基准形状"(均匀天空通过相同
+# 管道产生的脏图), 并用它来归一化真实数据, 只保留按比例超出基准的部分。
+
+
+def _compute_pixel_solid_angles(L, M, N, n_radial=None, n_azimuthal=None):
+    """
+    计算每个像素的立体角 dΩ。
+
+    对于笛卡尔 (l,m) 网格: dΩ = |Δl·Δm| / n
+    对于极坐标 (天顶角, 方位角) 网格: dΩ = sin(ζ) · Δζ · Δφ
+
+    Parameters
+    ----------
+    L, M, N : ndarray
+        方向余弦网格。
+    n_radial, n_azimuthal : int or None
+        极坐标网格尺寸 (用于判断网格类型)。
+
+    Returns
+    -------
+    dOmega : ndarray, same shape as L
+        每个像素的立体角 (球面度)。
+    """
+    if n_radial is not None and n_azimuthal is not None:
+        # 极坐标网格: dΩ = sin(ζ) · Δζ · Δφ
+        d_zeta = np.radians(90.0) / n_radial   # Δζ in radians
+        d_phi = np.radians(360.0) / n_azimuthal  # Δφ in radians
+
+        zeta_grid = np.radians(np.linspace(0.0, 90.0, n_radial))
+        sin_zeta_2d = np.sin(zeta_grid)[:, np.newaxis]  # (n_radial, 1)
+
+        dOmega = np.full(L.shape, sin_zeta_2d * d_zeta * d_phi)
+    else:
+        # 笛卡尔 (l,m) 网格: dΩ = |Δl·Δm| / n
+        dl = L[0, 1] - L[0, 0] if L.shape[1] > 1 else 0.0
+        dm = M[1, 0] - M[0, 0] if M.shape[0] > 1 else 0.0
+        pixel_area = abs(dl * dm)
+
+        n_clipped = np.maximum(N, 1e-6)
+        dOmega = np.full(L.shape, pixel_area / n_clipped)
+
+    return dOmega
+
+
+def _compute_uniform_sky_visibilities(L, M, N, horizon_mask, dOmega,
+                                       baselines_u, baselines_v, baselines_w):
+    """
+    正演模拟: 计算亮度均匀为1的天空在每条基线上产生的复可见度。
+
+    可见度方程:
+      V_k = ∫∫ B(l,m) · e^(-2πi(u_k·l + v_k·m + w_k·(n-1))) / n  dl dm
+          = ∫∫ B(l,m) · e^(-2πi(...))  dΩ
+
+    对均匀天空 B(l,m)=1, 在像素网格上数值积分:
+      V_k ≈ Σ_p e^(-2πi(u_k·l_p + v_k·m_p + w_k·(n_p-1))) · dΩ_p
+
+    Parameters
+    ----------
+    L, M, N : ndarray
+        方向余弦网格。
+    horizon_mask : ndarray, bool
+        有效像素掩膜。
+    dOmega : ndarray, same shape as L
+        每像素立体角，来自 _compute_pixel_solid_angles()。
+    baselines_u, baselines_v, baselines_w : ndarray, shape (28,)
+        基线坐标 (波长单位)。
+
+    Returns
+    -------
+    vis : ndarray, shape (28,), dtype complex128
+        均匀单位亮度天空的模拟复可见度。
+    """
+    n_baselines = len(baselines_u)
+
+    # 选取地平线以上的有效像素
+    valid = horizon_mask & (N > 1e-3)
+    l_flat = L[valid].ravel()
+    m_flat = M[valid].ravel()
+    n_flat = N[valid].ravel()
+    dOmega_flat = dOmega[valid].ravel()
+
+    vis = np.zeros(n_baselines, dtype=np.complex128)
+
+    # 逐基线正演积分: V_k = Σ_p e^(-2πi(u·l + v·m + w·(n-1))) · dΩ_p
+    for k in range(n_baselines):
+        # 相位: -2π(u·l + v·m + w·(n-1)) — 正演用负号
+        phase = -2.0 * np.pi * (
+            baselines_u[k] * l_flat +
+            baselines_v[k] * m_flat +
+            baselines_w[k] * (n_flat - 1.0)
+        )
+        # 被积函数: e^(i·phase) · dΩ
+        integrand = (np.cos(phase) + 1j * np.sin(phase)) * dOmega_flat
+        vis[k] = np.sum(integrand)
+
+    return vis
+
+
+def _compute_uniform_sky_auto_corr(L, M, N, horizon_mask, dOmega):
+    """
+    计算均匀单位亮度天空的自相关 (DC) 项。
+
+    单天线自相关 = ∫∫ 1 · dΩ ≈ Σ_p 1 · dΩ_p  (对均匀天空)
+    auto_corr_sum = 0.5 · Σ_{i=0}^{7} real(V_auto_i)  (与 _extract_visibility_data 一致)
+
+    Parameters
+    ----------
+    L, M, N, horizon_mask : ndarray
+        网格数据。
+    dOmega : ndarray
+        每像素立体角。
+
+    Returns
+    -------
+    auto_corr_sum : float
+    """
+    valid = horizon_mask & (N > 1e-3)
+    # 均匀天空单天线接收总流量 = ∫∫ 1 · dΩ ≈ Σ dΩ_p
+    flux_per_antenna = np.sum(dOmega[valid])
+
+    # 8根天线, 每根自相关相同
+    auto_corr_sum = 0.5 * 8.0 * flux_per_antenna
+    return float(auto_corr_sum)
+
+
+def _build_uniform_visibility_matrix(vis_cross, auto_corr_sum):
+    """
+    从互相关可见度和自相关和构建完整的 8x8 复可见度矩阵。
+
+    Parameters
+    ----------
+    vis_cross : ndarray, shape (28,), dtype complex128
+        28条互相关可见度 (上三角, 行优先)。
+    auto_corr_sum : float
+        自相关和: auto_corr_sum = 0.5 · Σ real(V[i,i])
+
+    Returns
+    -------
+    V : ndarray, shape (8, 8), dtype complex128
+    """
+    # 反推对角线值: auto_corr_sum = 0.5 * 8 * diag_val → diag_val = auto_corr_sum / 4
+    diag_val = auto_corr_sum / 4.0
+
+    V = np.zeros((8, 8), dtype=np.complex128)
+    np.fill_diagonal(V, diag_val)
+
+    idx = 0
+    for i in range(8):
+        for j in range(i + 1, 8):
+            V[i, j] = vis_cross[idx]
+            V[j, i] = np.conj(vis_cross[idx])
+            idx += 1
+
+    return V
+
+
+def compute_baseline_dirty_image(L, M, N, horizon_mask,
+                                  baselines_u, baselines_v, baselines_w,
+                                  apply_w_correction=True,
+                                  n_radial=None, n_azimuthal=None):
+    """
+    计算"基准脏图"——仪器对完全均匀单位亮度天空的响应。
+
+    这揭示了成像系统的内在非均匀性:
+      - 1/n 几何因子在大天顶角处的增强
+      - 非共面基线带来的 w-term 相位结构
+      - 稀疏 uv 采样 (脏束) 的旁瓣图案
+
+    计算流程:
+      1. 正演模拟均匀天空产生的可见度
+      2. 用完全相同的重建管道生成脏图
+
+    Parameters
+    ----------
+    L, M, N, horizon_mask : ndarray
+        来自 build_lm_grid 或 build_polar_sky_grid_GPU 的网格。
+    baselines_u, baselines_v, baselines_w : ndarray, shape (28,)
+        基线坐标 (波长单位)。
+    apply_w_correction : bool
+    n_radial, n_azimuthal : int or None
+        极坐标网格尺寸。如果同时提供则使用极坐标立体角计算。
+
+    Returns
+    -------
+    baseline : ndarray, 与 L 同形状
+        基准脏图。
+    uniform_vis : ndarray, shape (8, 8), dtype complex128
+        模拟的均匀天空可见度矩阵 (可供缓存复用)。
+    """
+    # 计算像素立体角
+    dOmega = _compute_pixel_solid_angles(L, M, N,
+                                          n_radial=n_radial,
+                                          n_azimuthal=n_azimuthal)
+
+    # 1. 正演均匀天空可见度
+    vis_cross = _compute_uniform_sky_visibilities(
+        L, M, N, horizon_mask, dOmega,
+        baselines_u, baselines_v, baselines_w
+    )
+
+    # 2. 计算自相关 (DC 项)
+    auto_corr = _compute_uniform_sky_auto_corr(L, M, N, horizon_mask, dOmega)
+
+    # 3. 构建完整 8x8 矩阵
+    V_uniform = _build_uniform_visibility_matrix(vis_cross, auto_corr)
+
+    # 4. 提取可见度分量
+    vis_re, vis_im, auto_from_extract = _extract_visibility_data(V_uniform)
+
+    # 5. 与真实数据完全相同的重建管道
+    baseline = _direct_fourier_sum_cpu(
+        L, M, N,
+        baselines_u, baselines_v, baselines_w,
+        vis_re, vis_im,
+        auto_from_extract,
+        apply_w_correction,
+        horizon_mask
+    )
+
+    return baseline, V_uniform
+
+
+def apply_baseline_correction(dirty, baseline, method='relative_excess'):
+    """
+    从脏图中移除基准形状的影响。
+
+    Parameters
+    ----------
+    dirty : ndarray
+        真实数据的原始脏图。
+    baseline : ndarray
+        基准脏图 (均匀天空响应)。
+    method : str
+        'relative_excess': corrected = dirty/baseline - 1
+            0 = 与均匀天空相同; 正值 = 比均匀天空更亮。
+        'normalize': corrected = dirty/baseline
+            1 = 与均匀天空相同。
+
+    Returns
+    -------
+    corrected : ndarray
+        基准校正后的脏图。
+    """
+    baseline_max = np.max(np.abs(baseline)) if baseline.size > 0 else 1.0
+    eps = 1e-10 * max(baseline_max, 1.0)
+
+    # 避免除零
+    safe_baseline = np.where(np.abs(baseline) < eps, eps, baseline)
+
+    if method == 'relative_excess':
+        result = dirty / safe_baseline - 1.0
+    else:  # 'normalize'
+        result = dirty / safe_baseline
+
+    # 基准为零的像素 (地平线外) 置零
+    result[np.abs(baseline) < eps] = 0.0
+
+    return result
+
+
+# 基准脏图的内存缓存
+# key: (网格形状, uvw 哈希, 是否 w 修正)
+_baseline_cache = {}
+
+
+def _get_baseline_cache_key(L_shape, bu, bv, bw, apply_w_correction,
+                             n_radial=None, n_azimuthal=None):
+    """生成基准脏图缓存键。"""
+    uvw_hash = hash((
+        tuple(np.round(bu, 6)),
+        tuple(np.round(bv, 6)),
+        tuple(np.round(bw, 6)),
+    ))
+    return (L_shape, uvw_hash, apply_w_correction, n_radial, n_azimuthal)
+
+
+def _cached_baseline(L, M, N, horizon_mask,
+                      bu, bv, bw,
+                      apply_w_correction,
+                      n_radial=None, n_azimuthal=None,
+                      force_recompute=False):
+    """计算或从缓存中获取基准脏图。"""
+    key = _get_baseline_cache_key(
+        L.shape, bu, bv, bw, apply_w_correction,
+        n_radial=n_radial, n_azimuthal=n_azimuthal
+    )
+    if not force_recompute and key in _baseline_cache:
+        return _baseline_cache[key]
+
+    baseline, _ = compute_baseline_dirty_image(
+        L, M, N, horizon_mask,
+        bu, bv, bw,
+        apply_w_correction,
+        n_radial=n_radial, n_azimuthal=n_azimuthal
+    )
+    _baseline_cache[key] = baseline
+    return baseline
 
 
 def get_bandwidth_label(center_freq_mhz, n_channels, freq_sky_mhz=None):
