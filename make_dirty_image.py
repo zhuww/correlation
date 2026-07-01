@@ -1059,3 +1059,294 @@ def read_frequency_range_from_data(data_dir, center_freq_mhz=150.0):
     except Exception:
         pass
     return None, None
+
+
+# ==============================================================================
+# Broadband Visibility Loading & Imaging
+# ==============================================================================
+def _get_channel_indices(pair_name):
+    """返回 (row, col) 0-based 索引，从 pair 名称如 'CH1xCH2' 解析"""
+    import re
+    if '_AUTO' in pair_name:
+        m = re.search(r'CH(\d+)_AUTO', pair_name)
+        if m:
+            ch = int(m.group(1)) - 1
+            return ch, ch
+    elif 'x' in pair_name:
+        m = re.search(r'CH(\d+)xCH(\d+)', pair_name)
+        if m:
+            a, b = int(m.group(1)) - 1, int(m.group(2)) - 1
+            return max(a, b), min(a, b)
+    return None, None
+
+
+def load_broadband_visibilities(file_map, center_freq_mhz=150.0,
+                                n_channels=40, max_bins=4096):
+    """
+    Read visibilities at multiple frequency channels from a set of CSV files.
+
+    Parameters
+    ----------
+    file_map : dict
+        {pair_name: filepath} mapping for one frame.
+    center_freq_mhz : float
+        Center sky frequency in MHz.
+    n_channels : int
+        Number of evenly-spaced frequency channels to use.
+    max_bins : int
+        Maximum number of frequency bins in the CSV files.
+
+    Returns
+    -------
+    freq_sky_mhz : ndarray, shape (n_channels,)
+        Sky frequency for each channel.
+    vis_all : ndarray, shape (n_channels, 8, 8), dtype complex128
+        Visibility matrix (8x8) for each frequency channel.
+    """
+    import pandas as pd
+
+    if n_channels >= max_bins:
+        n_channels = max_bins
+
+    # Evenly-spaced bin indices
+    bin_indices = np.linspace(0, max_bins - 1, n_channels, dtype=int)
+
+    # Pre-allocate: (n_channels, 8 ant, 8 ant)
+    vis_all = np.zeros((n_channels, 8, 8), dtype=np.complex128)
+    freq_sky_mhz = np.zeros(n_channels, dtype=np.float64)
+
+    # Cache CSV data to avoid repeated I/O
+    csv_cache = {}
+    for pair_name, filepath in file_map.items():
+        try:
+            df = pd.read_csv(filepath, comment='#', usecols=['frequency_index',
+                                                              'real_part',
+                                                              'imag_part'])
+            csv_cache[pair_name] = df
+        except Exception:
+            pass
+
+    # Also read frequency_hz from first file to get actual sky frequencies
+    first_file = next(iter(file_map.values()))
+    try:
+        df_freq = pd.read_csv(first_file, comment='#', usecols=['frequency_hz'])
+        f_base_hz = df_freq['frequency_hz'].values
+        for ci, bi in enumerate(bin_indices):
+            if bi < len(f_base_hz):
+                freq_sky_mhz[ci] = center_freq_mhz + f_base_hz[bi] / 1e6
+            else:
+                freq_sky_mhz[ci] = center_freq_mhz
+    except Exception:
+        freq_sky_mhz[:] = center_freq_mhz
+
+    # Fill visibility matrices
+    for ci, bi in enumerate(bin_indices):
+        for pair_name, filepath in file_map.items():
+            row_idx, col_idx = _get_channel_indices(pair_name)
+            if row_idx is None or col_idx is None:
+                continue
+            df = csv_cache.get(pair_name)
+            if df is None:
+                continue
+            try:
+                actual_idx = df['frequency_index'].values[bi]
+                if actual_idx == bi:
+                    r = df.iloc[bi]
+                    val = complex(r['real_part'], r['imag_part'])
+                    vis_all[ci, row_idx, col_idx] = val
+                    if row_idx != col_idx:
+                        vis_all[ci, col_idx, row_idx] = val.conjugate()
+            except (IndexError, KeyError):
+                pass
+
+    return freq_sky_mhz, vis_all
+
+
+def make_dirty_image_broadband_cpu(antennas_filepath, file_map,
+                                   center_freq_mhz=150.0,
+                                   grid_pts=256, fov_deg=30.0,
+                                   apply_w_correction=True,
+                                   filter_rfi=True,
+                                   hour_angle_deg=0.0, declination_deg=90.0,
+                                   n_channels=40, max_bins=4096,
+                                   verbose=True):
+    """
+    Broadband dirty image via multi-frequency direct 3D Fourier integration
+    on a Cartesian (l, m) grid.
+
+    Instead of using a single frequency bin, this integrates over N evenly-spaced
+    frequency channels across the full baseband, properly accounting for
+    frequency-dependent (u,v,w) coordinates and visibilities.
+
+    I_broad(l,m) = 1/N Σ_c I_{fc}(l,m)
+
+    """
+    # 1. Load broadband visibilities
+    freq_sky_mhz, vis_all = load_broadband_visibilities(
+        file_map, center_freq_mhz=center_freq_mhz,
+        n_channels=n_channels, max_bins=max_bins
+    )
+
+    if verbose:
+        lo, hi = np.min(freq_sky_mhz), np.max(freq_sky_mhz)
+        bw_eff = hi - lo
+        print(f"  Broadband: {n_channels} channels, "
+              f"{lo:.1f}–{hi:.1f} MHz "
+              f"(Δf = {bw_eff:.1f} MHz)")
+
+    # 2. Load antennas
+    antennas = load_optimized_antennas(antennas_filepath)
+
+    # 3. Build Cartesian (l, m) grid (same for all channels)
+    L, M, N, horizon_mask, l_axis, m_axis = build_lm_grid(
+        grid_pts=grid_pts, fov_deg=fov_deg
+    )
+
+    # 4. Integrate over frequency
+    dirty = np.zeros((grid_pts, grid_pts), dtype=np.float64)
+
+    for ci in range(n_channels):
+        vis = vis_all[ci]
+        f_mhz = freq_sky_mhz[ci]
+
+        # RFI flagging (per channel)
+        if filter_rfi:
+            vis = reject_rfi_visibilities(vis)
+
+        # Compute (u,v,w) at this channel's frequency
+        wavelength = 299.792458 / f_mhz
+        bu, bv, bw = compute_uvw_from_antennas(
+            antennas, wavelength,
+            hour_angle_deg=hour_angle_deg,
+            declination_deg=declination_deg
+        )
+
+        # Extract visibility data
+        vis_re, vis_im, auto_corr_sum = _extract_visibility_data(vis)
+
+        # Fourier sum for this channel
+        channel_dirty = _direct_fourier_sum_cpu(
+            L, M, N, bu, bv, bw,
+            vis_re, vis_im, auto_corr_sum,
+            apply_w_correction, horizon_mask
+        )
+
+        dirty += channel_dirty
+
+    dirty /= n_channels
+
+    return dirty, l_axis, m_axis, freq_sky_mhz
+
+
+def make_dirty_image_broadband_polar_cpu(antennas_filepath, file_map,
+                                         center_freq_mhz=150.0,
+                                         grid_pts=256, fov_deg=180.0,
+                                         apply_w_correction=True,
+                                         filter_rfi=True,
+                                         hour_angle_deg=0.0,
+                                         declination_deg=90.0,
+                                         n_channels=40, max_bins=4096,
+                                         n_radial=None, n_azimuthal=None,
+                                         num_threads=0, verbose=True):
+    """
+    Broadband all-sky dirty image via multi-frequency direct 3D Fourier
+    integration on a polar (zenith, azimuth) grid.
+
+    Uses CFFI C module with OpenMP for parallel frequency integration.
+    """
+    # 1. Load broadband visibilities
+    freq_sky_mhz, vis_all = load_broadband_visibilities(
+        file_map, center_freq_mhz=center_freq_mhz,
+        n_channels=n_channels, max_bins=max_bins
+    )
+
+    if verbose:
+        lo, hi = np.min(freq_sky_mhz), np.max(freq_sky_mhz)
+        bw_eff = hi - lo
+        print(f"  Broadband: {n_channels} channels, "
+              f"{lo:.1f}–{hi:.1f} MHz "
+              f"(Δf = {bw_eff:.1f} MHz)")
+
+    # 2. Load antennas
+    antennas = load_optimized_antennas(antennas_filepath)
+
+    # 3. Grid dimensions
+    if n_radial is None:
+        n_radial = max(grid_pts // 2, 64)
+    if n_azimuthal is None:
+        n_azimuthal = max(grid_pts, 128)
+
+    # 4. Build polar sky grid (same for all channels)
+    L, M, N, horizon_mask, _, _ = build_polar_sky_grid_GPU(
+        n_radial=n_radial, n_azimuthal=n_azimuthal
+    )
+
+    if fov_deg < 180.0:
+        fov_rad = np.radians(fov_deg / 2.0)
+        zeta_grid = np.radians(np.linspace(0.0, 90.0, n_radial))
+        zeta_2d = zeta_grid[:, np.newaxis]
+        fov_mask = zeta_2d <= fov_rad
+        horizon_mask = horizon_mask & fov_mask
+
+    # 5. Integrate over frequency
+    dirty = np.zeros((n_radial, n_azimuthal), dtype=np.float64)
+
+    use_cffi = _polar_cpu_available()
+
+    for ci in range(n_channels):
+        vis = vis_all[ci]
+        f_mhz = freq_sky_mhz[ci]
+
+        if filter_rfi:
+            vis = reject_rfi_visibilities(vis)
+
+        wavelength = 299.792458 / f_mhz
+        bu, bv, bw = compute_uvw_from_antennas(
+            antennas, wavelength,
+            hour_angle_deg=hour_angle_deg,
+            declination_deg=declination_deg
+        )
+
+        vis_re, vis_im, auto_corr_sum = _extract_visibility_data(vis)
+
+        if use_cffi:
+            try:
+                from polar_cpu_cffi import polar_fourier_sum
+                channel_dirty = polar_fourier_sum(
+                    n_radial, n_azimuthal,
+                    bu, bv, bw,
+                    vis_re, vis_im, auto_corr_sum,
+                    apply_w_correction, num_threads
+                )
+                # Apply horizon mask
+                channel_dirty[~horizon_mask] = 0.0
+            except Exception:
+                channel_dirty = _direct_fourier_sum_cpu(
+                    L, M, N, bu, bv, bw,
+                    vis_re, vis_im, auto_corr_sum,
+                    apply_w_correction, horizon_mask
+                )
+        else:
+            channel_dirty = _direct_fourier_sum_cpu(
+                L, M, N, bu, bv, bw,
+                vis_re, vis_im, auto_corr_sum,
+                apply_w_correction, horizon_mask
+            )
+
+        dirty += channel_dirty
+
+    dirty /= n_channels
+
+    return dirty, freq_sky_mhz
+
+
+def get_bandwidth_label(center_freq_mhz, n_channels, freq_sky_mhz=None):
+    """Generate a bandwidth label string for display."""
+    if n_channels <= 1:
+        return f"{center_freq_mhz:.0f} MHz (single channel, no bandwidth)"
+    if freq_sky_mhz is not None:
+        lo = float(np.min(freq_sky_mhz))
+        hi = float(np.max(freq_sky_mhz))
+        bw = hi - lo
+        return f"{lo:.1f}–{hi:.1f} MHz (Δf={bw:.1f} MHz, {n_channels} ch)"
+    return f"{center_freq_mhz:.0f} MHz (broadband, {n_channels} ch)"

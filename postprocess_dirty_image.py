@@ -40,7 +40,9 @@ from make_dirty_image import (make_dirty_image_cpu,
                               load_optimized_antennas,
                               get_polar_grid_metadata,
                               compute_uv_tracks,
-                              read_frequency_range_from_data)
+                              read_frequency_range_from_data,
+                              load_broadband_visibilities,
+                              get_bandwidth_label)
 
 
 # ==============================================================================
@@ -151,14 +153,14 @@ class PostProcessPlayer:
     def __init__(self, watch_dir="correlation_results",
                  freq_mhz=150.0, fov_deg=180.0, grid_pts=256,
                  antennas_file="optimized_antenna_coordinates.txt",
-                 freq_bin_idx=0, imaging_mode="cpu",
+                 n_channels=20, imaging_mode="cpu",
                  play_interval=0.5):
         self.watch_dir = Path(watch_dir)
         self.freq_mhz = freq_mhz
         self.fov_deg = fov_deg
         self.grid_pts = grid_pts
         self.antennas_file = antennas_file
-        self.freq_bin_idx = freq_bin_idx
+        self.n_channels = n_channels
         self.imaging_mode = imaging_mode
         self.play_interval = play_interval  # 播放间隔（秒）
 
@@ -255,13 +257,13 @@ class PostProcessPlayer:
         interval_spin.pack(side=tk.LEFT, padx=2)
         interval_spin.bind("<Return>", lambda e: self._update_interval())
 
-        # 频率 bin
-        ttk.Label(toolbar, text="Bin:").pack(side=tk.LEFT, padx=(10, 2))
-        self.bin_var = tk.StringVar(value=str(self.freq_bin_idx))
-        bin_spin = ttk.Spinbox(toolbar, from_=0, to=4095, increment=1,
-                                textvariable=self.bin_var, width=6)
-        bin_spin.pack(side=tk.LEFT, padx=2)
-        bin_spin.bind("<Return>", lambda e: self._update_bin())
+        # 宽带通道数
+        ttk.Label(toolbar, text="NCh:").pack(side=tk.LEFT, padx=(10, 2))
+        self.nch_var = tk.StringVar(value=str(self.n_channels))
+        nch_spin = ttk.Spinbox(toolbar, from_=1, to=200, increment=5,
+                                textvariable=self.nch_var, width=5)
+        nch_spin.pack(side=tk.LEFT, padx=2)
+        nch_spin.bind("<Return>", lambda e: self._update_nch())
 
         # 频率
         ttk.Label(toolbar, text="Freq (MHz):").pack(side=tk.LEFT, padx=(10, 2))
@@ -591,62 +593,78 @@ class PostProcessPlayer:
         thread.start()
 
     def _preprocess_frames(self, frames):
-        """后台线程：逐个计算所有 frame 的脏图"""
+        """后台线程：逐个计算所有 frame 的宽带脏图"""
         self.frame_images = [None] * self.total_frames
         self.frame_peaks = [None] * self.total_frames
         self.frame_channels = [0] * self.total_frames
+
+        from make_dirty_image import (
+            _extract_visibility_data, _direct_fourier_sum_cpu,
+            compute_uvw_from_antennas, reject_rfi_visibilities,
+            build_lm_grid, build_polar_sky_grid_GPU
+        )
 
         for idx, ts in enumerate(self.frame_timestamps):
             if not self.running:
                 return
 
             file_map = frames[ts]
-            self._update_status_main(f"Processing frame {idx + 1}/{self.total_frames}: {ts}")
-
-            # 构建可见度矩阵
-            vis, active_channels = build_visibility_matrix_from_files(
-                file_map, self.freq_bin_idx
+            self._update_status_main(
+                f"Processing frame {idx + 1}/{self.total_frames}: {ts}"
             )
 
-            # RFI 安全检查
-            effective_rfi = self.filter_rfi
-            if effective_rfi and len(active_channels) < 8:
-                effective_rfi = False
+            # 宽带加载可见度
+            freq_sky_mhz, vis_all = load_broadband_visibilities(
+                file_map, center_freq_mhz=self.freq_mhz,
+                n_channels=self.n_channels
+            )
 
-            # 调用成像引擎
             try:
-                if self.imaging_mode == "gpu":
-                    make_dirty_image_GPU, _, _ = _lazy_import_gpu()
-                    dirty_img = make_dirty_image_GPU(
-                        antennas_filepath=self.antennas_file,
-                        visibilities=vis,
-                        freq_mhz=self.freq_mhz,
-                        grid_pts=self.grid_pts,
-                        fov_deg=self.fov_deg,
-                        apply_w_correction=True,
-                        filter_rfi=effective_rfi
+                if self.imaging_mode in ("polar_cpu", "gpu"):
+                    n_radial = max(self.grid_pts // 2, 64)
+                    n_azimuthal = max(self.grid_pts, 128)
+                    L, M, N, horizon_mask, _, _ = build_polar_sky_grid_GPU(
+                        n_radial=n_radial, n_azimuthal=n_azimuthal
                     )
-                elif self.imaging_mode == "polar_cpu":
-                    make_dirty_image_polar_cpu, _, _ = _lazy_import_polar_cpu()
-                    dirty_img = make_dirty_image_polar_cpu(
-                        antennas_filepath=self.antennas_file,
-                        visibilities=vis,
-                        freq_mhz=self.freq_mhz,
-                        grid_pts=self.grid_pts,
-                        fov_deg=self.fov_deg,
-                        apply_w_correction=True,
-                        filter_rfi=effective_rfi
-                    )
+                    if self.fov_deg < 180.0:
+                        fov_rad = np.radians(self.fov_deg / 2.0)
+                        zeta_grid = np.radians(np.linspace(0.0, 90.0, n_radial))
+                        zeta_2d = zeta_grid[:, np.newaxis]
+                        fov_mask = zeta_2d <= fov_rad
+                        horizon_mask = horizon_mask & fov_mask
+                    dirty_img = np.zeros((n_radial, n_azimuthal), dtype=np.float64)
                 else:
-                    dirty_img, l_axis, m_axis = make_dirty_image_cpu(
-                        antennas_filepath=self.antennas_file,
-                        visibilities=vis,
-                        freq_mhz=self.freq_mhz,
-                        grid_pts=self.grid_pts,
-                        fov_deg=self.fov_deg,
-                        apply_w_correction=True,
-                        filter_rfi=effective_rfi
+                    L, M, N, horizon_mask, _, _ = build_lm_grid(
+                        grid_pts=self.grid_pts, fov_deg=self.fov_deg
                     )
+                    dirty_img = np.zeros((self.grid_pts, self.grid_pts),
+                                         dtype=np.float64)
+
+                for ci in range(self.n_channels):
+                    vis = vis_all[ci]
+                    f_mhz = freq_sky_mhz[ci]
+
+                    if self.filter_rfi:
+                        vis = reject_rfi_visibilities(vis)
+
+                    wavelength = 299.792458 / f_mhz
+                    bu, bv, bw = compute_uvw_from_antennas(
+                        self.antennas, wavelength
+                    )
+                    vis_re, vis_im, auto_corr_sum = _extract_visibility_data(vis)
+                    ch_dirty = _direct_fourier_sum_cpu(
+                        L, M, N, bu, bv, bw,
+                        vis_re, vis_im, auto_corr_sum,
+                        True, horizon_mask
+                    )
+                    dirty_img += ch_dirty
+
+                dirty_img /= self.n_channels
+
+                # 计算活跃天线通道数
+                n_active_ant = int(np.sum(np.any(
+                    np.abs(vis_all) > 1e-12, axis=(0, 1)
+                )))
 
                 # 提取峰值信息
                 valid = dirty_img[dirty_img != 0]
@@ -662,15 +680,19 @@ class PostProcessPlayer:
                         peak_info = (peak_val, meta['zeta_deg'][peak_idx[0]],
                                      meta['az_deg'][peak_idx[1]])
                     else:
-                        peak_l = l_axis[peak_idx[1]]
-                        peak_m = m_axis[peak_idx[0]]
+                        l_max = np.sin(np.radians(self.fov_deg / 2))
+                        _la = np.linspace(-l_max, l_max, dirty_img.shape[1])
+                        _ma = np.linspace(l_max, -l_max, dirty_img.shape[0])
+                        peak_l = _la[peak_idx[1]]
+                        peak_m = _ma[peak_idx[0]]
                         peak_info = (peak_val, peak_l, peak_m)
                 else:
                     peak_info = (0, 0, 0)
+                    n_active_ant = 0
 
                 self.frame_images[idx] = dirty_img
                 self.frame_peaks[idx] = peak_info
-                self.frame_channels[idx] = len(active_channels)
+                self.frame_channels[idx] = n_active_ant
 
             except Exception as e:
                 print(f"[ERROR] Frame {ts}: {e}")
@@ -922,9 +944,9 @@ class PostProcessPlayer:
         except ValueError:
             pass
 
-    def _update_bin(self):
+    def _update_nch(self):
         try:
-            self.freq_bin_idx = int(self.bin_var.get())
+            self.n_channels = int(self.nch_var.get())
             self._rescan()
         except ValueError:
             pass
@@ -972,8 +994,9 @@ def main():
                         help='Image grid points (default: 256)')
     parser.add_argument('--antennas', default='optimized_antenna_coordinates.txt',
                         help='Antenna coordinate file')
-    parser.add_argument('--bin', type=int, default=0,
-                        help='Frequency bin index to use (default: 0)')
+    parser.add_argument('--nch', type=int, default=20,
+                        help='Number of broadband frequency channels (default: 20, '
+                             '1 = legacy single-channel)')
     parser.add_argument('--mode', choices=['cpu', 'gpu', 'polar_cpu'], default='cpu',
                         help='Imaging mode: cpu (Cartesian l,m), gpu (Polar CuPy), polar_cpu (Polar C/OpenMP)')
     parser.add_argument('--interval', type=float, default=0.5,
@@ -1001,7 +1024,7 @@ def main():
     print(f"  Frequency:     {args.freq} MHz")
     print(f"  FOV:           {args.fov}°")
     print(f"  Grid:          {args.grid}×{args.grid}")
-    print(f"  Freq bin idx:  {args.bin}")
+    print(f"  Broadband ch:  {args.nch}")
     print(f"  Play interval: {args.interval}s")
     print(f"  Imaging mode:  {args.mode.upper()}")
     print(f"  GPU available: {'YES' if gpu_avail else 'NO'}")
@@ -1015,7 +1038,7 @@ def main():
         fov_deg=args.fov,
         grid_pts=args.grid,
         antennas_file=args.antennas,
-        freq_bin_idx=args.bin,
+        n_channels=args.nch,
         imaging_mode=args.mode,
         play_interval=args.interval
     )

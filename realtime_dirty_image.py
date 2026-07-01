@@ -42,7 +42,9 @@ from make_dirty_image import (make_dirty_image_cpu,
                                load_optimized_antennas,
                                get_polar_grid_metadata,
                                compute_uv_tracks,
-                               read_frequency_range_from_data)
+                               read_frequency_range_from_data,
+                               load_broadband_visibilities,
+                               get_bandwidth_label)
 
 
 # ==============================================================================
@@ -166,12 +168,13 @@ class RealtimeDirtyImageApp:
                  freq_mhz=150.0, fov_deg=30.0, grid_pts=256,
                  antennas_file="optimized_antenna_coordinates.txt",
                  save_images=True, output_dir="dirty_image_frames",
-                 imaging_mode="cpu"):
+                 imaging_mode="cpu", n_channels=10):
         self.watch_dir = Path(watch_dir)
         self.refresh_interval = refresh_interval
         self.freq_mhz = freq_mhz
         self.fov_deg = fov_deg
         self.grid_pts = grid_pts
+        self.n_channels = n_channels
         self.antennas_file = antennas_file
         self.save_images = save_images
         self.output_dir = Path(output_dir)
@@ -614,70 +617,105 @@ class RealtimeDirtyImageApp:
     # 核心逻辑
     # ------------------------------------------------------------------
     def _load_and_image(self):
-        """加载最新数据并计算脏图"""
-        vis, timestamp, active_channels = self.loader.build_visibility_matrix()
-
-        if vis is None:
+        """加载最新数据并计算宽带脏图"""
+        csv_files = self.loader.get_latest_csv_files()
+        if not csv_files:
             self.status_var.set("Waiting for data... (no CSV files found)")
             return None, None, set()
 
+        # 提取时间戳
+        timestamps_set = set()
+        for pair_name in csv_files:
+            m = re.search(r'correlation_(\d{8}_\d{6})', csv_files[pair_name].name)
+            if m:
+                timestamps_set.add(m.group(1))
+        if not timestamps_set:
+            self.status_var.set("Waiting for data... (invalid filenames)")
+            return None, None, set()
+
+        timestamp = sorted(timestamps_set)[-1]
+
         if timestamp == self.last_timestamp:
             self.status_var.set(f"No new data (latest: {timestamp})")
-            return None, timestamp, active_channels
+            return None, timestamp, set()
 
         self.last_timestamp = timestamp
 
-        # ---- RFI 过滤安全检查：仅在所有 8 通道到齐时启用 ----
-        effective_rfi = self.filter_rfi
-        if effective_rfi and len(active_channels) < 8:
-            missing = [f"CH{i+1}" for i in range(8) if i not in active_channels]
-            print(f"[RFI-SAFETY] 仅 {len(active_channels)}/8 通道到齐，"
-                  f"缺失: {', '.join(missing)}，暂时关闭 RFI 过滤")
-            effective_rfi = False
+        # 宽带加载可见度
+        freq_sky_mhz, vis_all = load_broadband_visibilities(
+            csv_files, center_freq_mhz=self.freq_mhz,
+            n_channels=self.n_channels
+        )
 
-        # 调用对应的成像引擎
+        # 检测有数据的通道
+        n_active = sum(1 for ci in range(self.n_channels)
+                       if np.any(np.abs(vis_all[ci]) > 0))
+        active_channels = set(range(8))  # simplified for broadband
+
+        if n_active == 0:
+            self.status_var.set("No active data")
+            return None, timestamp, active_channels
+
+        effective_rfi = self.filter_rfi
+
+        # 宽带成像
         try:
-            if self.imaging_mode == "gpu":
-                make_dirty_image_GPU, _, _ = _lazy_import_gpu()
-                dirty_img = make_dirty_image_GPU(
-                    antennas_filepath=self.antennas_file,
-                    visibilities=vis,
-                    freq_mhz=self.freq_mhz,
-                    grid_pts=self.grid_pts,
-                    fov_deg=self.fov_deg,
-                    apply_w_correction=True,
-                    filter_rfi=effective_rfi
+            from make_dirty_image import (
+                _extract_visibility_data, _direct_fourier_sum_cpu,
+                compute_uvw_from_antennas, reject_rfi_visibilities,
+                build_lm_grid, build_polar_sky_grid_GPU
+            )
+            antennas = load_optimized_antennas(self.antennas_file)
+
+            if self.imaging_mode in ("polar_cpu", "gpu"):
+                n_radial = max(self.grid_pts // 2, 64)
+                n_azimuthal = max(self.grid_pts, 128)
+                L, M, N, horizon_mask, _, _ = build_polar_sky_grid_GPU(
+                    n_radial=n_radial, n_azimuthal=n_azimuthal
                 )
-                return dirty_img, timestamp, active_channels
-            elif self.imaging_mode == "polar_cpu":
-                make_dirty_image_polar_cpu, _, _ = _lazy_import_polar_cpu()
-                dirty_img = make_dirty_image_polar_cpu(
-                    antennas_filepath=self.antennas_file,
-                    visibilities=vis,
-                    freq_mhz=self.freq_mhz,
-                    grid_pts=self.grid_pts,
-                    fov_deg=self.fov_deg,
-                    apply_w_correction=True,
-                    filter_rfi=effective_rfi
-                )
-                return dirty_img, timestamp, active_channels
+                if self.fov_deg < 180.0:
+                    fov_rad = np.radians(self.fov_deg / 2.0)
+                    zeta_grid = np.radians(np.linspace(0.0, 90.0, n_radial))
+                    zeta_2d = zeta_grid[:, np.newaxis]
+                    fov_mask = zeta_2d <= fov_rad
+                    horizon_mask = horizon_mask & fov_mask
+                dirty_img = np.zeros((n_radial, n_azimuthal), dtype=np.float64)
             else:
-                dirty_img, l_axis, m_axis = make_dirty_image_cpu(
-                    antennas_filepath=self.antennas_file,
-                    visibilities=vis,
-                    freq_mhz=self.freq_mhz,
-                    grid_pts=self.grid_pts,
-                    fov_deg=self.fov_deg,
-                    apply_w_correction=True,
-                    filter_rfi=effective_rfi
+                L, M, N, horizon_mask, _, _ = build_lm_grid(
+                    grid_pts=self.grid_pts, fov_deg=self.fov_deg
                 )
-                return (dirty_img, l_axis, m_axis), timestamp, active_channels
+                dirty_img = np.zeros((self.grid_pts, self.grid_pts),
+                                     dtype=np.float64)
+
+            for ci in range(self.n_channels):
+                vis = vis_all[ci]
+                f_mhz = freq_sky_mhz[ci]
+
+                if effective_rfi:
+                    vis = reject_rfi_visibilities(vis)
+
+                wavelength = 299.792458 / f_mhz
+                bu, bv, bw = compute_uvw_from_antennas(antennas, wavelength)
+                vis_re, vis_im, auto_corr_sum = _extract_visibility_data(vis)
+                ch_dirty = _direct_fourier_sum_cpu(
+                    L, M, N, bu, bv, bw,
+                    vis_re, vis_im, auto_corr_sum,
+                    True, horizon_mask
+                )
+                dirty_img += ch_dirty
+
+            dirty_img /= self.n_channels
+
+            bw_label = get_bandwidth_label(self.freq_mhz, self.n_channels,
+                                           freq_sky_mhz)
+            self.status_var.set(f"Updated: {timestamp} | {bw_label}")
+            return dirty_img, timestamp, active_channels
+
         except Exception as e:
-            self.status_var.set(f"Image computation error: {e}")
-            print(f"[ERROR] make_dirty_image failed: {e}")
+            print(f"[ERROR] Imaging failed: {e}")
             import traceback
             traceback.print_exc()
-            return None, timestamp, active_channels
+            return None, timestamp, set()
 
     def refresh(self):
         """执行一次完整的刷新：读取 → 成像 → 显示 → 保存"""
@@ -696,12 +734,13 @@ class RealtimeDirtyImageApp:
         if self.imaging_mode in ("gpu", "polar_cpu"):
             self._refresh_polar(dirty_data, timestamp, n_channels)
         else:
-            dirty_img, l_axis, m_axis = dirty_data
-            self._refresh_cartesian(dirty_img, l_axis, m_axis, timestamp, n_channels)
+            self._refresh_cartesian(dirty_data, timestamp, n_channels)
 
-    def _refresh_cartesian(self, dirty_img, l_axis, m_axis, timestamp, n_channels):
+    def _refresh_cartesian(self, dirty_img, timestamp, n_channels):
         """Cartesian (l, m) 波数坐标脏图显示更新"""
-        l_max = l_axis[-1]
+        l_max = np.sin(np.radians(self.fov_deg / 2))
+        l_axis = np.linspace(-l_max, l_max, dirty_img.shape[1])
+        m_axis = np.linspace(l_max, -l_max, dirty_img.shape[0])
         m_min, m_max = m_axis[-1], m_axis[0]
 
         self.im_dirty.set_extent([-l_max, l_max, m_min, m_max])
@@ -925,8 +964,9 @@ def main():
                         help='Output directory for saved PNG frames')
     parser.add_argument('--no-save', action='store_true',
                         help='Disable automatic PNG saving')
-    parser.add_argument('--bin', type=int, default=0,
-                        help='Frequency bin index to use (default: 0)')
+    parser.add_argument('--nch', type=int, default=10,
+                        help='Number of broadband frequency channels (default: 10, '
+                             '1 = legacy single-channel)')
     parser.add_argument('--mode', choices=['cpu', 'gpu', 'polar_cpu'], default='cpu',
                         help='Imaging mode: cpu (Cartesian l,m), gpu (Polar CuPy), polar_cpu (Polar C/OpenMP)')
 
@@ -974,7 +1014,7 @@ def main():
     print(f"  FOV:            {args.fov}°")
     print(f"  Grid:           {args.grid}×{args.grid}")
     print(f"  Refresh:        {args.interval}s")
-    print(f"  Freq bin idx:   {args.bin}")
+    print(f"  Broadband ch:   {args.nch}")
     print(f"  Save frames:    {not args.no_save}")
     print(f"  Output dir:     {args.output}")
     print(f"  Imaging mode:   {args.mode.upper()}")
@@ -992,9 +1032,9 @@ def main():
         antennas_file=args.antennas,
         save_images=not args.no_save,
         output_dir=args.output,
-        imaging_mode=args.mode
+        imaging_mode=args.mode,
+        n_channels=args.nch
     )
-    app.loader.freq_bin_idx = args.bin
     app.run()
 
 

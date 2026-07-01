@@ -49,6 +49,10 @@ from datetime import datetime, timedelta
 from make_dirty_image import (
     make_dirty_image_cpu,
     make_dirty_image_polar_cpu,
+    make_dirty_image_broadband_cpu,
+    make_dirty_image_broadband_polar_cpu,
+    load_broadband_visibilities,
+    get_bandwidth_label,
     load_optimized_antennas,
     compute_uvw_from_antennas,
     compute_uv_tracks,
@@ -202,76 +206,125 @@ def compute_hour_angle(timestamp_str, longitude_deg=116.0):
 # ==============================================================================
 # 方法 1: Snapshot 积分（不考虑天体位移）
 # ==============================================================================
-def integrate_snapshot(frames_by_ts, freq_bin_idx, freq_mhz, grid_pts, fov_deg,
+def integrate_snapshot(frames_by_ts, freq_mhz, grid_pts, fov_deg,
                        antennas_file, filter_rfi, apply_w_correction,
-                       imaging_mode, verbose=True):
+                       imaging_mode, n_channels=40, verbose=True):
     """
-    Snapshot 模式：将所有 frame 的可见度矩阵直接平均，然后生成一张脏图。
+    Snapshot 模式：将所有 frame 的可见度矩阵直接平均，然后生成一张宽带脏图。
 
     物理假设：整个观测期间天空亮度分布不变（天体在视场中不移动）。
-    数学：V_avg = (1/N) Σ V_k，然后 I_D = FT(V_avg)
+    数学：V_avg(f) = (1/N) Σ_k V_k(f)，然后 I_D = Σ_f FT(V_avg(f))
 
-    优点：计算快（只需要一次成像）
+    优点：计算快（只需要一次宽带成像）
     缺点：天体运动会造成源展宽/模糊
     """
     if verbose:
         print(f"\n{'='*60}")
         print(f"  Method: SNAPSHOT (no celestial motion compensation)")
-        print(f"  Strategy: Average visibilities → single imaging")
+        print(f"  Strategy: Average visibilities → broadband imaging")
         print(f"{'='*60}")
 
-    # 收集所有 frame 的可见度矩阵
-    all_vis = []
+    # 收集所有 frame 的宽带可见度
     timestamps = list(frames_by_ts.keys())
+    all_vis_channels = []
     active_count = 0
+    freq_sky_mhz = None
 
     for ts in timestamps:
         file_map = frames_by_ts[ts]
-        vis, active = build_visibility_matrix_from_files(file_map, freq_bin_idx)
-        if len(active) > 0:
-            all_vis.append(vis)
+        f_sky, vis_channels = load_broadband_visibilities(
+            file_map, center_freq_mhz=freq_mhz, n_channels=n_channels
+        )
+        if freq_sky_mhz is None:
+            freq_sky_mhz = f_sky
+
+        # Check if any channel has data
+        has_data = np.any(np.abs(vis_channels) > 0)
+        if has_data:
+            all_vis_channels.append(vis_channels)
             active_count += 1
         elif verbose:
             print(f"  [SKIP] Frame {ts}: no active channels")
 
-    if not all_vis:
+    if not all_vis_channels:
         print("  [ERROR] No valid frames to integrate!")
         return None
 
-    # 平均可见度
-    vis_avg = np.mean(all_vis, axis=0)
+    # 平均可见度（per channel）
+    vis_avg = np.mean(all_vis_channels, axis=0)  # (n_channels, 8, 8)
 
     if verbose:
-        print(f"  Integrated {len(all_vis)}/{len(timestamps)} frames")
+        bw_label = get_bandwidth_label(freq_mhz, n_channels, freq_sky_mhz)
+        print(f"  Bandwidth: {bw_label}")
+        print(f"  Integrated {len(all_vis_channels)}/{len(timestamps)} frames")
         print(f"  Imaging with averaged visibilities...")
 
-    # 判断是否需要 RFI
-    effective_rfi = filter_rfi
-    if effective_rfi and active_count < len(timestamps):
-        effective_rfi = False
-
-    # 单次成像
+    # 宽带成像
     t0 = time.time()
+
+    antennas = load_optimized_antennas(antennas_file)
+
     if imaging_mode in ("polar_cpu", "gpu"):
-        dirty = make_dirty_image_polar_cpu(
-            antennas_filepath=antennas_file,
-            visibilities=vis_avg,
-            freq_mhz=freq_mhz,
-            grid_pts=grid_pts,
-            fov_deg=fov_deg,
-            apply_w_correction=apply_w_correction,
-            filter_rfi=effective_rfi,
+        n_radial = max(grid_pts // 2, 64)
+        n_azimuthal = max(grid_pts, 128)
+        L, M, N, horizon_mask, _, _ = build_polar_sky_grid_GPU(
+            n_radial=n_radial, n_azimuthal=n_azimuthal
         )
+        if fov_deg < 180.0:
+            fov_rad = np.radians(fov_deg / 2.0)
+            zeta_grid = np.radians(np.linspace(0.0, 90.0, n_radial))
+            zeta_2d = zeta_grid[:, np.newaxis]
+            fov_mask = zeta_2d <= fov_rad
+            horizon_mask = horizon_mask & fov_mask
+
+        dirty = np.zeros((n_radial, n_azimuthal), dtype=np.float64)
+
+        for ci in range(n_channels):
+            vis = vis_avg[ci]
+            f_mhz = freq_sky_mhz[ci]
+
+            if filter_rfi:
+                vis = reject_rfi_visibilities(vis)
+
+            wavelength = 299.792458 / f_mhz
+            bu, bv, bw = compute_uvw_from_antennas(
+                antennas, wavelength
+            )
+            vis_re, vis_im, auto_corr_sum = _extract_visibility_data(vis)
+            ch_dirty = _direct_fourier_sum_cpu(
+                L, M, N, bu, bv, bw,
+                vis_re, vis_im, auto_corr_sum,
+                apply_w_correction, horizon_mask
+            )
+            dirty += ch_dirty
+
+        dirty /= n_channels
     else:
-        dirty, l_axis, m_axis = make_dirty_image_cpu(
-            antennas_filepath=antennas_file,
-            visibilities=vis_avg,
-            freq_mhz=freq_mhz,
-            grid_pts=grid_pts,
-            fov_deg=fov_deg,
-            apply_w_correction=apply_w_correction,
-            filter_rfi=effective_rfi,
+        L, M, N, horizon_mask, l_axis, m_axis = build_lm_grid(
+            grid_pts=grid_pts, fov_deg=fov_deg
         )
+        dirty = np.zeros((grid_pts, grid_pts), dtype=np.float64)
+
+        for ci in range(n_channels):
+            vis = vis_avg[ci]
+            f_mhz = freq_sky_mhz[ci]
+
+            if filter_rfi:
+                vis = reject_rfi_visibilities(vis)
+
+            wavelength = 299.792458 / f_mhz
+            bu, bv, bw = compute_uvw_from_antennas(
+                antennas, wavelength
+            )
+            vis_re, vis_im, auto_corr_sum = _extract_visibility_data(vis)
+            ch_dirty = _direct_fourier_sum_cpu(
+                L, M, N, bu, bv, bw,
+                vis_re, vis_im, auto_corr_sum,
+                apply_w_correction, horizon_mask
+            )
+            dirty += ch_dirty
+
+        dirty /= n_channels
 
     elapsed = time.time() - t0
     if verbose:
@@ -283,30 +336,32 @@ def integrate_snapshot(frames_by_ts, freq_bin_idx, freq_mhz, grid_pts, fov_deg,
 # ==============================================================================
 # 方法 2: Tracked 积分（考虑天体位移）
 # ==============================================================================
-def integrate_tracked(frames_by_ts, freq_bin_idx, freq_mhz, grid_pts, fov_deg,
+def integrate_tracked(frames_by_ts, freq_mhz, grid_pts, fov_deg,
                       antennas_file, filter_rfi, apply_w_correction,
-                      imaging_mode, longitude_deg=116.0, verbose=True):
+                      imaging_mode, longitude_deg=116.0, n_channels=40,
+                      verbose=True):
     """
     Tracked 模式：每个 frame 用其时角对应的 (u,v,w) 独立成像，然后叠加脏图。
+    同时每个 frame 使用多频率通道实现宽带 uv 覆盖积分。
 
     物理假设：天空亮度分布在天球上固定，地球自转导致 uv 覆盖在 (u,v)
-    平面旋转。每个 frame 对应不同的 uv 采样，叠加后获得更好的 uv 覆盖。
+    平面旋转。每个 frame × 每个频率通道对应不同的 uv 采样，叠加后获得
+    更好的 uv 覆盖。
 
     数学：
-      I_D(l,m) = (1/N) Σ_k FT^{-1}[V_k(u_k, v_k, w_k)]
-    其中 (u_k, v_k, w_k) 由第 k 个 frame 的时角决定。
+      I_D(l,m) = 1/(N×C) Σ_k Σ_c FT^{-1}[V_k(f_c, u_{k,c}, v_{k,c}, w_{k,c})]
+    其中 (u_{k,c}, v_{k,c}, w_{k,c}) 由第 k 个 frame 的时角和第 c 个频率决定。
 
-    优点：补偿地球自转，uv 覆盖更完整，源不会被展宽
-    缺点：计算量 N 倍于 snapshot
+    优点：补偿地球自转 + 宽带频率积分，uv 覆盖最完整
+    缺点：计算量 N_frames × N_channels × 28 baselines
     """
     if verbose:
         print(f"\n{'='*60}")
         print(f"  Method: TRACKED (with celestial motion compensation)")
-        print(f"  Strategy: Per-frame imaging with rotating (u,v,w) → stack")
+        print(f"  Strategy: Per-frame × per-channel imaging → stack")
         print(f"{'='*60}")
 
     antennas = load_optimized_antennas(antennas_file)
-    wavelength = 299.792458 / freq_mhz
     timestamps = list(frames_by_ts.keys())
 
     # 确定网格
@@ -319,70 +374,83 @@ def integrate_tracked(frames_by_ts, freq_bin_idx, freq_mhz, grid_pts, fov_deg,
 
     valid_frames = 0
     total_frames = len(timestamps)
+    freq_sky_mhz = None
 
     for idx, ts in enumerate(timestamps):
         file_map = frames_by_ts[ts]
-        vis, active = build_visibility_matrix_from_files(file_map, freq_bin_idx)
+        f_sky, vis_channels = load_broadband_visibilities(
+            file_map, center_freq_mhz=freq_mhz, n_channels=n_channels
+        )
+        if freq_sky_mhz is None:
+            freq_sky_mhz = f_sky
 
-        if len(active) == 0:
+        has_data = np.any(np.abs(vis_channels) > 0)
+        if not has_data:
             if verbose:
-                print(f"  [{idx+1}/{total_frames}] {ts}: SKIP (no active channels)")
+                print(f"  [{idx+1}/{total_frames}] {ts}: SKIP (no data)")
             continue
 
         # 计算此时刻的时角
         hour_angle = compute_hour_angle(ts, longitude_deg)
 
-        if filter_rfi:
-            vis = reject_rfi_visibilities(vis)
-
-        # 提取可见度数据
-        vis_re, vis_im, auto_corr_sum = _extract_visibility_data(vis)
-
-        # 计算时变 (u, v, w)
-        bu, bv, bw = compute_uvw_from_antennas(
-            antennas, wavelength,
-            hour_angle_deg=hour_angle,
-            declination_deg=90.0
-        )
-
         t0 = time.time()
+        frame_dirty = np.zeros_like(integrated)
 
-        if imaging_mode in ("polar_cpu", "gpu"):
-            # 构建极坐标网格
-            L, M, N, horizon_mask, _, _ = build_polar_sky_grid_GPU(
-                n_radial=n_radial,
-                n_azimuthal=n_azimuthal
-            )
-            if fov_deg < 180.0:
-                fov_rad = np.radians(fov_deg / 2.0)
-                zeta_grid = np.radians(np.linspace(0.0, 90.0, n_radial))
-                zeta_2d = zeta_grid[:, np.newaxis]
-                fov_mask = zeta_2d <= fov_rad
-                horizon_mask = horizon_mask & fov_mask
+        for ci in range(n_channels):
+            vis = vis_channels[ci]
+            f_mhz = freq_sky_mhz[ci]
 
-            frame_dirty = _direct_fourier_sum_cpu(
-                L, M, N, bu, bv, bw,
-                vis_re, vis_im, auto_corr_sum,
-                apply_w_correction, horizon_mask
-            )
-        else:
-            L, M, N, horizon_mask, _, _ = build_lm_grid(
-                grid_pts=grid_pts, fov_deg=fov_deg
-            )
-            frame_dirty = _direct_fourier_sum_cpu(
-                L, M, N, bu, bv, bw,
-                vis_re, vis_im, auto_corr_sum,
-                apply_w_correction, horizon_mask
+            if filter_rfi:
+                vis = reject_rfi_visibilities(vis)
+
+            # 计算时变 + 频率相关的 (u, v, w)
+            wavelength = 299.792458 / f_mhz
+            bu, bv, bw = compute_uvw_from_antennas(
+                antennas, wavelength,
+                hour_angle_deg=hour_angle,
+                declination_deg=90.0
             )
 
+            vis_re, vis_im, auto_corr_sum = _extract_visibility_data(vis)
+
+            if imaging_mode in ("polar_cpu", "gpu"):
+                L, M, N, horizon_mask, _, _ = build_polar_sky_grid_GPU(
+                    n_radial=n_radial, n_azimuthal=n_azimuthal
+                )
+                if fov_deg < 180.0:
+                    fov_rad = np.radians(fov_deg / 2.0)
+                    zeta_grid = np.radians(np.linspace(0.0, 90.0, n_radial))
+                    zeta_2d = zeta_grid[:, np.newaxis]
+                    fov_mask = zeta_2d <= fov_rad
+                    horizon_mask = horizon_mask & fov_mask
+
+                ch_dirty = _direct_fourier_sum_cpu(
+                    L, M, N, bu, bv, bw,
+                    vis_re, vis_im, auto_corr_sum,
+                    apply_w_correction, horizon_mask
+                )
+            else:
+                L, M, N, horizon_mask, _, _ = build_lm_grid(
+                    grid_pts=grid_pts, fov_deg=fov_deg
+                )
+                ch_dirty = _direct_fourier_sum_cpu(
+                    L, M, N, bu, bv, bw,
+                    vis_re, vis_im, auto_corr_sum,
+                    apply_w_correction, horizon_mask
+                )
+
+            frame_dirty += ch_dirty
+
+        frame_dirty /= n_channels
         elapsed = time.time() - t0
+
         integrated += frame_dirty
         valid_frames += 1
 
         if verbose:
             ha_str = f"HA={hour_angle:.1f}°"
             print(f"  [{idx+1}/{total_frames}] {ts}  {ha_str}  "
-                  f"ch={len(active)}/8  imaging={elapsed:.2f}s")
+                  f"imaging={elapsed:.2f}s")
 
     if valid_frames == 0:
         print("  [ERROR] No valid frames to integrate!")
@@ -392,6 +460,8 @@ def integrate_tracked(frames_by_ts, freq_bin_idx, freq_mhz, grid_pts, fov_deg,
     integrated /= valid_frames
 
     if verbose:
+        bw_label = get_bandwidth_label(freq_mhz, n_channels, freq_sky_mhz)
+        print(f"  Bandwidth: {bw_label}")
         valid = integrated[integrated != 0]
         peak = float(np.max(valid)) if len(valid) > 0 else 0.0
         print(f"\n  Integrated {valid_frames}/{total_frames} frames")
@@ -406,6 +476,7 @@ def integrate_tracked(frames_by_ts, freq_bin_idx, freq_mhz, grid_pts, fov_deg,
 def save_integrated_image(dirty_img, date_str, method, imaging_mode,
                           freq_mhz, fov_deg, grid_pts, output_dir,
                           antennas=None, antennas_file=None,
+                          n_channels=40, freq_sky_mhz=None,
                           verbose=True):
     """
     保存积分脏图为 PNG 和 NPY，附带 UV 覆盖图。
@@ -507,8 +578,9 @@ def save_integrated_image(dirty_img, date_str, method, imaging_mode,
         cbar.ax.yaxis.label.set_color('white')
         cbar.ax.tick_params(colors='white')
 
+        bw_label = get_bandwidth_label(freq_mhz, n_channels, freq_sky_mhz)
         title = (f"Integrated All-Sky Dirty Image — {date_str}\n"
-                 f"Method: {method.upper()}  |  {freq_mhz:.0f} MHz  |  "
+                 f"Method: {method.upper()}  |  {bw_label}  |  "
                  f"FOV={fov_deg:.0f}°  |  Grid: {nr}×{na} polar")
         ax.set_title(title, color='white', fontsize=13)
 
@@ -537,8 +609,9 @@ def save_integrated_image(dirty_img, date_str, method, imaging_mode,
         ax.set_ylabel("m (South-North)", color='white')
         ax.tick_params(colors='white', labelsize=8)
 
+        bw_label = get_bandwidth_label(freq_mhz, n_channels, freq_sky_mhz)
         title = (f"Integrated Dirty Image — {date_str}\n"
-                 f"Method: {method.upper()}  |  {freq_mhz:.0f} MHz  |  "
+                 f"Method: {method.upper()}  |  {bw_label}  |  "
                  f"FOV={fov_deg:.0f}°  |  Grid: {grid_pts}×{grid_pts}")
         ax.set_title(title, color='white', fontsize=13)
 
@@ -695,8 +768,9 @@ def main():
                         help='Image grid points (default: 256)')
     parser.add_argument('--antennas', default='optimized_antenna_coordinates.txt',
                         help='Antenna coordinate file')
-    parser.add_argument('--bin', type=int, default=0,
-                        help='Frequency bin index to use (default: 0)')
+    parser.add_argument('--nch', type=int, default=40,
+                        help='Number of broadband frequency channels (default: 40, '
+                             '1 = single-channel legacy mode)')
     parser.add_argument('--mode', choices=['cpu', 'gpu', 'polar_cpu'],
                         default='polar_cpu',
                         help='Imaging mode: cpu (Cartesian), gpu (Polar GPU), '
@@ -759,14 +833,15 @@ def main():
     for method in methods_to_run:
         if method == "snapshot":
             dirty = integrate_snapshot(
-                frames_by_ts, args.bin, args.freq, args.grid, args.fov,
-                args.antennas, filter_rfi, apply_w_correction, args.mode
+                frames_by_ts, args.freq, args.grid, args.fov,
+                args.antennas, filter_rfi, apply_w_correction, args.mode,
+                n_channels=args.nch
             )
         else:
             dirty = integrate_tracked(
-                frames_by_ts, args.bin, args.freq, args.grid, args.fov,
+                frames_by_ts, args.freq, args.grid, args.fov,
                 args.antennas, filter_rfi, apply_w_correction, args.mode,
-                longitude_deg=args.lon
+                longitude_deg=args.lon, n_channels=args.nch
             )
 
         if dirty is not None:
@@ -781,7 +856,8 @@ def main():
         save_integrated_image(
             dirty, date_str, method, args.mode,
             args.freq, args.fov, args.grid, args.output,
-            antennas_file=args.antennas
+            antennas_file=args.antennas,
+            n_channels=args.nch
         )
 
     total_elapsed = time.time() - total_start
