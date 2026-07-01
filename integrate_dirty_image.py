@@ -612,7 +612,7 @@ def _draw_uv_coverage_subplot(ax_uv, antennas, freq_mhz, data_dir=None):
         v_track = -uv_lines[bl_idx, :, 1]
         ax_uv.plot(
             u_track, v_track,
-            color='gray', linewidth=0.6, alpha=0.3,
+            color='#ff8c42', linewidth=1.0, alpha=0.6,
             linestyle='--', zorder=2
         )
 
@@ -637,7 +637,7 @@ def _draw_uv_coverage_subplot(ax_uv, antennas, freq_mhz, data_dir=None):
                label=f'uv track ({flo:.0f}–{fhi:.0f} MHz)'),
         Line2D([0], [0], marker='D', color='w', markerfacecolor='cyan',
                markersize=6, label=f'{freq_mhz:.0f} MHz center'),
-        Line2D([0], [0], linestyle='--', color='gray', linewidth=1,
+        Line2D([0], [0], linestyle='--', color='#ff8c42', linewidth=1,
                label='(−u,−v) conjugate'),
     ]
     ax_uv.legend(handles=legend_elements, loc='upper right',
