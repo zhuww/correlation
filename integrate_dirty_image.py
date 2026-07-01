@@ -64,6 +64,8 @@ from make_dirty_image import (
     build_lm_grid,
     build_polar_sky_grid_GPU,
     compute_display_norm,
+    _cached_baseline,
+    apply_baseline_correction,
 )
 
 
@@ -209,7 +211,8 @@ def compute_hour_angle(timestamp_str, longitude_deg=116.0):
 # ==============================================================================
 def integrate_snapshot(frames_by_ts, freq_mhz, grid_pts, fov_deg,
                        antennas_file, filter_rfi, apply_w_correction,
-                       imaging_mode, n_channels=40, verbose=True):
+                       imaging_mode, n_channels=40, subtract_baseline=False,
+                       verbose=True):
     """
     Snapshot 模式：将所有 frame 的可见度矩阵直接平均，然后生成一张宽带脏图。
 
@@ -222,6 +225,8 @@ def integrate_snapshot(frames_by_ts, freq_mhz, grid_pts, fov_deg,
     if verbose:
         print(f"\n{'='*60}")
         print(f"  Method: SNAPSHOT (no celestial motion compensation)")
+        if subtract_baseline:
+            print(f"  Baseline subtraction: ENABLED")
         print(f"  Strategy: Average visibilities → broadband imaging")
         print(f"{'='*60}")
 
@@ -249,7 +254,7 @@ def integrate_snapshot(frames_by_ts, freq_mhz, grid_pts, fov_deg,
 
     if not all_vis_channels:
         print("  [ERROR] No valid frames to integrate!")
-        return None
+        return None, None
 
     # 平均可见度（per channel）
     vis_avg = np.mean(all_vis_channels, axis=0)  # (n_channels, 8, 8)
@@ -264,6 +269,7 @@ def integrate_snapshot(frames_by_ts, freq_mhz, grid_pts, fov_deg,
     t0 = time.time()
 
     antennas = load_optimized_antennas(antennas_file)
+    accumulated_uv = []  # 收集所有 (u,v) 坐标用于 UV 覆盖图
 
     if imaging_mode in ("polar_cpu", "gpu"):
         n_radial = max(grid_pts // 2, 64)
@@ -279,6 +285,7 @@ def integrate_snapshot(frames_by_ts, freq_mhz, grid_pts, fov_deg,
             horizon_mask = horizon_mask & fov_mask
 
         dirty = np.zeros((n_radial, n_azimuthal), dtype=np.float64)
+        baseline_acc = np.zeros_like(dirty) if subtract_baseline else None
 
         for ci in range(n_channels):
             vis = vis_avg[ci]
@@ -291,6 +298,9 @@ def integrate_snapshot(frames_by_ts, freq_mhz, grid_pts, fov_deg,
             bu, bv, bw = compute_uvw_from_antennas(
                 antennas, wavelength
             )
+            # 收集 UV 坐标
+            accumulated_uv.append((bu.copy(), bv.copy(), f_mhz))
+
             vis_re, vis_im, auto_corr_sum = _extract_visibility_data(vis)
             ch_dirty = _direct_fourier_sum_cpu(
                 L, M, N, bu, bv, bw,
@@ -299,12 +309,24 @@ def integrate_snapshot(frames_by_ts, freq_mhz, grid_pts, fov_deg,
             )
             dirty += ch_dirty
 
+            if subtract_baseline:
+                bl = _cached_baseline(
+                    L, M, N, horizon_mask,
+                    bu, bv, bw, apply_w_correction,
+                    n_radial=n_radial, n_azimuthal=n_azimuthal
+                )
+                baseline_acc += bl
+
         dirty /= n_channels
+        if subtract_baseline:
+            baseline_acc /= n_channels
+
     else:
         L, M, N, horizon_mask, l_axis, m_axis = build_lm_grid(
             grid_pts=grid_pts, fov_deg=fov_deg
         )
         dirty = np.zeros((grid_pts, grid_pts), dtype=np.float64)
+        baseline_acc = np.zeros_like(dirty) if subtract_baseline else None
 
         for ci in range(n_channels):
             vis = vis_avg[ci]
@@ -317,6 +339,9 @@ def integrate_snapshot(frames_by_ts, freq_mhz, grid_pts, fov_deg,
             bu, bv, bw = compute_uvw_from_antennas(
                 antennas, wavelength
             )
+            # 收集 UV 坐标
+            accumulated_uv.append((bu.copy(), bv.copy(), f_mhz))
+
             vis_re, vis_im, auto_corr_sum = _extract_visibility_data(vis)
             ch_dirty = _direct_fourier_sum_cpu(
                 L, M, N, bu, bv, bw,
@@ -325,13 +350,28 @@ def integrate_snapshot(frames_by_ts, freq_mhz, grid_pts, fov_deg,
             )
             dirty += ch_dirty
 
+            if subtract_baseline:
+                bl = _cached_baseline(
+                    L, M, N, horizon_mask,
+                    bu, bv, bw, apply_w_correction,
+                )
+                baseline_acc += bl
+
         dirty /= n_channels
+        if subtract_baseline:
+            baseline_acc /= n_channels
+
+    # 应用基线校正
+    if subtract_baseline and baseline_acc is not None:
+        dirty = apply_baseline_correction(dirty, baseline_acc, method='relative_excess')
+        if verbose:
+            print(f"  Baseline correction applied (relative_excess)")
 
     elapsed = time.time() - t0
     if verbose:
         print(f"  Imaging completed in {elapsed:.2f}s")
 
-    return dirty
+    return dirty, accumulated_uv
 
 
 # ==============================================================================
@@ -340,7 +380,7 @@ def integrate_snapshot(frames_by_ts, freq_mhz, grid_pts, fov_deg,
 def integrate_tracked(frames_by_ts, freq_mhz, grid_pts, fov_deg,
                       antennas_file, filter_rfi, apply_w_correction,
                       imaging_mode, longitude_deg=116.0, n_channels=40,
-                      verbose=True):
+                      subtract_baseline=False, verbose=True):
     """
     Tracked 模式：每个 frame 用其时角对应的 (u,v,w) 独立成像，然后叠加脏图。
     同时每个 frame 使用多频率通道实现宽带 uv 覆盖积分。
@@ -359,6 +399,8 @@ def integrate_tracked(frames_by_ts, freq_mhz, grid_pts, fov_deg,
     if verbose:
         print(f"\n{'='*60}")
         print(f"  Method: TRACKED (with celestial motion compensation)")
+        if subtract_baseline:
+            print(f"  Baseline subtraction: ENABLED")
         print(f"  Strategy: Per-frame × per-channel imaging → stack")
         print(f"{'='*60}")
 
@@ -373,9 +415,11 @@ def integrate_tracked(frames_by_ts, freq_mhz, grid_pts, fov_deg,
     else:
         integrated = np.zeros((grid_pts, grid_pts), dtype=np.float64)
 
+    baseline_integrated = np.zeros_like(integrated) if subtract_baseline else None
     valid_frames = 0
     total_frames = len(timestamps)
     freq_sky_mhz = None
+    accumulated_uv = []  # 收集所有 frame×channel 的 (u,v) 坐标
 
     for idx, ts in enumerate(timestamps):
         file_map = frames_by_ts[ts]
@@ -396,6 +440,7 @@ def integrate_tracked(frames_by_ts, freq_mhz, grid_pts, fov_deg,
 
         t0 = time.time()
         frame_dirty = np.zeros_like(integrated)
+        frame_baseline = np.zeros_like(integrated) if subtract_baseline else None
 
         for ci in range(n_channels):
             vis = vis_channels[ci]
@@ -411,6 +456,8 @@ def integrate_tracked(frames_by_ts, freq_mhz, grid_pts, fov_deg,
                 hour_angle_deg=hour_angle,
                 declination_deg=90.0
             )
+            # 收集 UV 坐标 (每个 frame、每个 channel)
+            accumulated_uv.append((bu.copy(), bv.copy(), f_mhz))
 
             vis_re, vis_im, auto_corr_sum = _extract_visibility_data(vis)
 
@@ -442,10 +489,24 @@ def integrate_tracked(frames_by_ts, freq_mhz, grid_pts, fov_deg,
 
             frame_dirty += ch_dirty
 
+            if subtract_baseline:
+                bl = _cached_baseline(
+                    L, M, N, horizon_mask,
+                    bu, bv, bw, apply_w_correction,
+                    n_radial=n_radial if imaging_mode in ("polar_cpu", "gpu") else None,
+                    n_azimuthal=n_azimuthal if imaging_mode in ("polar_cpu", "gpu") else None
+                )
+                frame_baseline += bl
+
         frame_dirty /= n_channels
+        if subtract_baseline:
+            frame_baseline /= n_channels
+
         elapsed = time.time() - t0
 
         integrated += frame_dirty
+        if subtract_baseline:
+            baseline_integrated += frame_baseline
         valid_frames += 1
 
         if verbose:
@@ -455,10 +516,19 @@ def integrate_tracked(frames_by_ts, freq_mhz, grid_pts, fov_deg,
 
     if valid_frames == 0:
         print("  [ERROR] No valid frames to integrate!")
-        return None
+        return None, None
 
     # 平均
     integrated /= valid_frames
+    if subtract_baseline:
+        baseline_integrated /= valid_frames
+
+    # 应用基线校正
+    if subtract_baseline and baseline_integrated is not None:
+        integrated = apply_baseline_correction(integrated, baseline_integrated,
+                                               method='relative_excess')
+        if verbose:
+            print(f"  Baseline correction applied (relative_excess)")
 
     if verbose:
         bw_label = get_bandwidth_label(freq_mhz, n_channels, freq_sky_mhz)
@@ -468,7 +538,7 @@ def integrate_tracked(frames_by_ts, freq_mhz, grid_pts, fov_deg,
         print(f"\n  Integrated {valid_frames}/{total_frames} frames")
         print(f"  Peak intensity: {peak:.4f}")
 
-    return integrated
+    return integrated, accumulated_uv
 
 
 # ==============================================================================
@@ -478,12 +548,20 @@ def save_integrated_image(dirty_img, date_str, method, imaging_mode,
                           freq_mhz, fov_deg, grid_pts, output_dir,
                           antennas=None, antennas_file=None,
                           n_channels=40, freq_sky_mhz=None,
-                          scale="linear", verbose=True):
+                          scale="linear", accumulated_uv=None,
+                          subtract_baseline=False, verbose=True):
     """
     保存积分脏图为 PNG 和 NPY，附带 UV 覆盖图。
 
     极坐标模式: 鱼眼全天图
     Cartesian 模式: 标准 l/m 投影图
+
+    Parameters
+    ----------
+    accumulated_uv : list of (bu, bv, f_mhz) tuples, optional
+        积分过程中收集的所有 (u,v) 坐标，用于绘制积分 UV 覆盖图。
+    subtract_baseline : bool
+        是否应用了基线去除（用于标注）。
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -492,10 +570,11 @@ def save_integrated_image(dirty_img, date_str, method, imaging_mode,
     if antennas is None and antennas_file is not None:
         antennas = load_optimized_antennas(antennas_file)
 
-    has_uv = antennas is not None
+    has_uv = antennas is not None or accumulated_uv is not None
 
     import matplotlib.gridspec as gridspec
-    fig = plt.figure(figsize=(14, 9), facecolor='#1a1a2e',
+    fig = plt.figure(figsize=(16, 10) if has_uv else (14, 9),
+                     facecolor='#1a1a2e',
                      layout='constrained' if has_uv else None)
 
     if has_uv:
@@ -577,9 +656,10 @@ def save_integrated_image(dirty_img, date_str, method, imaging_mode,
         cbar.ax.tick_params(colors='white')
 
         scale_note = " [LOG]" if scale == "log" else ""
+        baseline_note = " [BASELINE]" if subtract_baseline else ""
         bw_label = get_bandwidth_label(freq_mhz, n_channels, freq_sky_mhz)
         title = (f"Integrated All-Sky Dirty Image — {date_str}\n"
-                 f"Method: {method.upper()}  |  {bw_label}{scale_note}  |  "
+                 f"Method: {method.upper()}  |  {bw_label}{scale_note}{baseline_note}  |  "
                  f"FOV={fov_deg:.0f}°  |  Grid: {nr}×{na} polar")
         ax.set_title(title, color='white', fontsize=13)
 
@@ -607,16 +687,19 @@ def save_integrated_image(dirty_img, date_str, method, imaging_mode,
         ax.tick_params(colors='white', labelsize=8)
 
         scale_note = " [LOG]" if scale == "log" else ""
+        baseline_note = " [BASELINE]" if subtract_baseline else ""
         bw_label = get_bandwidth_label(freq_mhz, n_channels, freq_sky_mhz)
         title = (f"Integrated Dirty Image — {date_str}\n"
-                 f"Method: {method.upper()}  |  {bw_label}{scale_note}  |  "
+                 f"Method: {method.upper()}  |  {bw_label}{scale_note}{baseline_note}  |  "
                  f"FOV={fov_deg:.0f}°  |  Grid: {grid_pts}×{grid_pts}")
         ax.set_title(title, color='white', fontsize=13)
 
     # ── UV 覆盖 + 天线布局子图 ──
     if has_uv:
         _draw_uv_coverage_subplot(ax_uv, antennas, freq_mhz,
-                                  data_dir=output_dir.parent / "correlation_results")
+                                  data_dir=output_dir.parent / "correlation_results",
+                                  accumulated_uv=accumulated_uv,
+                                  method=method)
         _draw_antenna_layout_subplot(ax_ant, antennas)
     else:
         fig.tight_layout(pad=2.0)
@@ -636,8 +719,9 @@ def save_integrated_image(dirty_img, date_str, method, imaging_mode,
     return png_path, npy_path
 
 
-def _draw_uv_coverage_subplot(ax_uv, antennas, freq_mhz, data_dir=None):
-    """在指定轴上绘制宽带 UV 覆盖图（频率相关的 uv 轨迹线）"""
+def _draw_uv_coverage_subplot(ax_uv, antennas, freq_mhz, data_dir=None,
+                               accumulated_uv=None, method="snapshot"):
+    """在指定轴上绘制 UV 覆盖图（理论轨迹 + 积分 UV 采样点）"""
     # 读取实际频率范围
     flo, fhi = None, None
     if data_dir is not None:
@@ -662,6 +746,38 @@ def _draw_uv_coverage_subplot(ax_uv, antennas, freq_mhz, data_dir=None):
     n_baselines = uv_lines.shape[0]
     cmap = plt.cm.plasma
 
+    # ── 绘制积分 UV 采样点 (散点，半透明) ──
+    if accumulated_uv is not None and len(accumulated_uv) > 0:
+        all_u = []
+        all_v = []
+        for bu, bv, _f_mhz in accumulated_uv:
+            all_u.extend(bu)
+            all_v.extend(bv)
+            # 共轭对称点
+            all_u.extend(-bu)
+            all_v.extend(-bv)
+        all_u = np.array(all_u)
+        all_v = np.array(all_v)
+
+        # 采样密度着色
+        from scipy.stats import gaussian_kde
+        try:
+            xy = np.vstack([all_u, all_v])
+            z = gaussian_kde(xy)(xy)
+            idx = z.argsort()
+            all_u_s = all_u[idx]
+            all_v_s = all_v[idx]
+            z_s = z[idx]
+        except Exception:
+            all_u_s = all_u
+            all_v_s = all_v
+            z_s = np.ones_like(all_u)
+
+        sc = ax_uv.scatter(all_u_s, all_v_s, c=z_s,
+                           s=2, cmap='plasma', alpha=0.5,
+                           edgecolors='none', zorder=10, rasterized=True)
+
+    # ── 理论 UV 轨迹 (背景) ──
     for bl_idx in range(n_baselines):
         u_track = uv_lines[bl_idx, :, 0]
         v_track = uv_lines[bl_idx, :, 1]
@@ -669,54 +785,52 @@ def _draw_uv_coverage_subplot(ax_uv, antennas, freq_mhz, data_dir=None):
             t = s / (len(freq_samples) - 1)
             ax_uv.plot(
                 u_track[s:s+2], v_track[s:s+2],
-                color=cmap(0.2 + 0.6 * t), linewidth=1.2,
-                alpha=0.7, zorder=3
+                color=cmap(0.2 + 0.6 * t), linewidth=0.8,
+                alpha=0.35, zorder=3
             )
-        ax_uv.scatter(
-            u_track[0], v_track[0], c=[cmap(0.2)],
-            s=15, marker='o', edgecolors='white',
-            linewidths=0.3, zorder=5, alpha=0.8
-        )
 
     for bl_idx in range(n_baselines):
         u_track = -uv_lines[bl_idx, :, 0]
         v_track = -uv_lines[bl_idx, :, 1]
         ax_uv.plot(
             u_track, v_track,
-            color='#ff8c42', linewidth=1.0, alpha=0.6,
+            color='#ff8c42', linewidth=0.6, alpha=0.3,
             linestyle='--', zorder=2
         )
-
-    ax_uv.scatter(
-        uv_center[:, 0], uv_center[:, 1],
-        c='cyan', s=12, marker='D', edgecolors='white',
-        linewidths=0.3, zorder=6, alpha=0.9
-    )
 
     ax_uv.axhline(y=0, color='#336699', linewidth=0.5, alpha=0.5)
     ax_uv.axvline(x=0, color='#336699', linewidth=0.5, alpha=0.5)
 
+    # ── 自适应坐标范围 ──
     uv_max = max(np.max(np.abs(uv_lines[:, 0, :])),
                  np.max(np.abs(uv_lines[:, -1, :]))) * 1.15
+    if accumulated_uv is not None and len(accumulated_uv) > 0:
+        all_uv_max = max(np.max(np.abs(all_u)), np.max(np.abs(all_v))) * 1.15
+        uv_max = max(uv_max, all_uv_max)
     if uv_max > 0:
         ax_uv.set_xlim(-uv_max, uv_max)
         ax_uv.set_ylim(-uv_max, uv_max)
 
+    # ── 图例 ──
     from matplotlib.lines import Line2D
     legend_elements = [
-        Line2D([0], [0], color=cmap(0.5), linewidth=1.5,
-               label=f'uv track ({flo:.0f}–{fhi:.0f} MHz)'),
-        Line2D([0], [0], marker='D', color='w', markerfacecolor='cyan',
-               markersize=6, label=f'{freq_mhz:.0f} MHz center'),
-        Line2D([0], [0], linestyle='--', color='#ff8c42', linewidth=1,
+        Line2D([0], [0], marker='o', color='w', markerfacecolor=cmap(0.5),
+               markersize=5, label=f'Theory track ({flo:.0f}–{fhi:.0f} MHz)'),
+        Line2D([0], [0], linestyle='--', color='#ff8c42', linewidth=0.8,
                label='(−u,−v) conjugate'),
     ]
+    if accumulated_uv is not None and len(accumulated_uv) > 0:
+        legend_elements.insert(0, Line2D(
+            [0], [0], marker='o', color='w', markerfacecolor='#00ccff',
+            markersize=4, label=f'Integrated UV ({len(accumulated_uv)} samples)'
+        ))
     ax_uv.legend(handles=legend_elements, loc='upper right',
                  fontsize=5.5, facecolor='#16213e',
                  edgecolor='#336699', labelcolor='white')
 
+    method_label = method.upper()
     ax_uv.set_title(
-        f"UV Coverage (28 baselines, {flo:.0f}–{fhi:.0f} MHz)",
+        f"UV Coverage — {method_label} ({flo:.0f}–{fhi:.0f} MHz)",
         color='white', fontsize=10
     )
 
@@ -784,6 +898,8 @@ def main():
                         help='Output directory (default: integrated_images)')
     parser.add_argument('--scale', choices=['linear', 'log'], default='linear',
                         help='Display scale: linear or log (default: linear)')
+    parser.add_argument('--subtract-baseline', action='store_true',
+                        help='Subtract baseline (uniform-sky response) from dirty image')
     parser.add_argument('--no-rfi', action='store_true',
                         help='Disable RFI filtering')
 
@@ -817,6 +933,8 @@ def main():
     print(f"Grid: {args.grid}×{args.grid}")
     print(f"Mode: {args.mode}")
     print(f"RFI filter: {'OFF' if args.no_rfi else 'ON'}")
+    print(f"Baseline subtraction: {'ON' if args.subtract_baseline else 'OFF'}")
+    print(f"Display scale: {args.scale}")
 
     filter_rfi = not args.no_rfi
     apply_w_correction = True
@@ -830,22 +948,26 @@ def main():
         methods_to_run.append("tracked")
 
     results = {}
+    uv_data = {}  # 存储每个方法的 UV 覆盖数据
     for method in methods_to_run:
         if method == "snapshot":
-            dirty = integrate_snapshot(
+            dirty, acc_uv = integrate_snapshot(
                 frames_by_ts, args.freq, args.grid, args.fov,
                 args.antennas, filter_rfi, apply_w_correction, args.mode,
-                n_channels=args.nch
+                n_channels=args.nch,
+                subtract_baseline=args.subtract_baseline
             )
         else:
-            dirty = integrate_tracked(
+            dirty, acc_uv = integrate_tracked(
                 frames_by_ts, args.freq, args.grid, args.fov,
                 args.antennas, filter_rfi, apply_w_correction, args.mode,
-                longitude_deg=args.lon, n_channels=args.nch
+                longitude_deg=args.lon, n_channels=args.nch,
+                subtract_baseline=args.subtract_baseline
             )
 
         if dirty is not None:
             results[method] = dirty
+            uv_data[method] = acc_uv
 
     if not results:
         print("\n[ERROR] No integration results produced!")
@@ -858,7 +980,9 @@ def main():
             args.freq, args.fov, args.grid, args.output,
             antennas_file=args.antennas,
             n_channels=args.nch,
-            scale=args.scale
+            scale=args.scale,
+            accumulated_uv=uv_data.get(method),
+            subtract_baseline=args.subtract_baseline
         )
 
     total_elapsed = time.time() - total_start
