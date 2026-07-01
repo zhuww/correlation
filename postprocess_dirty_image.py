@@ -614,6 +614,7 @@ class PostProcessPlayer:
         self.status_var.set(f"Found {self.total_frames} frames. Pre-processing...")
 
         # 在后台线程中预处理
+        self.running = True
         thread = threading.Thread(target=self._preprocess_frames, args=(frames,), daemon=True)
         thread.start()
 
@@ -644,6 +645,9 @@ class PostProcessPlayer:
                 n_channels=self.n_channels
             )
 
+            # 捕获当前帧处理时的 subtract_baseline 状态，避免线程竞争
+            subtract_baseline = self.subtract_baseline
+
             try:
                 if self.imaging_mode in ("polar_cpu", "gpu"):
                     n_radial = max(self.grid_pts // 2, 64)
@@ -667,7 +671,7 @@ class PostProcessPlayer:
                                          dtype=np.float64)
 
                 # Per-channel baseline accumulator
-                baseline_acc = np.zeros_like(dirty_img) if self.subtract_baseline else None
+                baseline_acc = np.zeros_like(dirty_img) if subtract_baseline else None
 
                 for ci in range(self.n_channels):
                     vis = vis_all[ci]
@@ -689,7 +693,7 @@ class PostProcessPlayer:
                     dirty_img += ch_dirty
 
                     # Accumulate per-channel baseline
-                    if self.subtract_baseline:
+                    if subtract_baseline:
                         bl = _cached_baseline(
                             L, M, N, horizon_mask,
                             bu, bv, bw, True,
@@ -700,7 +704,7 @@ class PostProcessPlayer:
                 dirty_img /= self.n_channels
 
                 # Apply broadband baseline correction
-                if self.subtract_baseline and baseline_acc is not None:
+                if subtract_baseline and baseline_acc is not None:
                     baseline_acc /= self.n_channels
                     dirty_img = apply_baseline_correction(
                         dirty_img, baseline_acc, method='relative_excess'
@@ -970,6 +974,7 @@ class PostProcessPlayer:
         """重新扫描并预处理"""
         self.playing = False
         self.play_btn.config(text="▶ Play")
+        self.running = False  # 终止旧的后台线程
         self.frame_images = []
         self.frame_peaks = []
         self.frame_channels = []
