@@ -1350,3 +1350,79 @@ def get_bandwidth_label(center_freq_mhz, n_channels, freq_sky_mhz=None):
         bw = hi - lo
         return f"{lo:.1f}–{hi:.1f} MHz (Δf={bw:.1f} MHz, {n_channels} ch)"
     return f"{center_freq_mhz:.0f} MHz (broadband, {n_channels} ch)"
+
+
+def transform_display_data(dirty_img, scale="linear"):
+    """
+    Transform dirty image data for display with the chosen scale.
+
+    Parameters
+    ----------
+    dirty_img : ndarray
+        Raw dirty image (may contain negative values from Fourier synthesis).
+    scale : str
+        "linear" or "log".
+
+    Returns
+    -------
+    display_data : ndarray
+        Transformed data suitable for imshow/pcolormesh.
+    cbar_label : str
+        Label for the colorbar.
+    """
+    if scale == "log":
+        # For log display: use SymLogNorm-compatible data.
+        # We keep the raw data but signal that a SymLogNorm should be used.
+        # The caller should use matplotlib.colors.SymLogNorm for rendering.
+        # For simplicity, we return the raw data and a flag; the caller will
+        # handle the normalization.
+        return dirty_img, "Intensity (log₁₀ scale)"
+    else:
+        return dirty_img, "Intensity"
+
+
+def compute_display_norm(dirty_img, scale="linear", linthresh=None):
+    """
+    Compute an appropriate matplotlib Normalize object for the display scale.
+
+    Uses percentiles to set vmin/vmax for linear, and SymLogNorm for log scale
+    (which handles negative values gracefully with a linear region around zero).
+
+    Parameters
+    ----------
+    dirty_img : ndarray
+        Raw dirty image data.
+    scale : str
+        "linear" or "log".
+    linthresh : float or None
+        Linear threshold for SymLogNorm. If None, auto-computed from data.
+
+    Returns
+    -------
+    norm : matplotlib.colors.Normalize
+    vmin, vmax : float
+        The computed data range.
+    """
+    from matplotlib.colors import Normalize, SymLogNorm
+
+    valid = dirty_img[dirty_img != 0]
+    if len(valid) > 0:
+        vmin = float(np.percentile(valid, 2))
+        vmax = float(np.percentile(valid, 98))
+    else:
+        vmin, vmax = 0.0, 1.0
+    if vmax <= vmin:
+        vmax = vmin + 1e-6
+
+    if scale == "log":
+        if linthresh is None:
+            # Auto: use ~1% of the positive dynamic range
+            pos = valid[valid > 0]
+            if len(pos) > 0:
+                p1 = float(np.percentile(pos, 1))
+                linthresh = max(p1, 1e-6 * vmax)
+            else:
+                linthresh = vmax * 1e-4
+        return SymLogNorm(linthresh=linthresh, vmin=vmin, vmax=vmax, base=10), vmin, vmax
+    else:
+        return Normalize(vmin=vmin, vmax=vmax), vmin, vmax

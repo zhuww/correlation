@@ -42,7 +42,8 @@ from make_dirty_image import (make_dirty_image_cpu,
                               compute_uv_tracks,
                               read_frequency_range_from_data,
                               load_broadband_visibilities,
-                              get_bandwidth_label)
+                              get_bandwidth_label,
+                              compute_display_norm)
 
 
 # ==============================================================================
@@ -154,7 +155,7 @@ class PostProcessPlayer:
                  freq_mhz=150.0, fov_deg=180.0, grid_pts=256,
                  antennas_file="optimized_antenna_coordinates.txt",
                  n_channels=20, imaging_mode="cpu",
-                 play_interval=0.5):
+                 play_interval=0.5, scale="linear"):
         self.watch_dir = Path(watch_dir)
         self.freq_mhz = freq_mhz
         self.fov_deg = fov_deg
@@ -163,6 +164,7 @@ class PostProcessPlayer:
         self.n_channels = n_channels
         self.imaging_mode = imaging_mode
         self.play_interval = play_interval  # 播放间隔（秒）
+        self.scale = scale  # "linear" or "log"
 
         # 帧数据
         self.frame_timestamps = []       # 有序时间戳列表
@@ -288,6 +290,16 @@ class PostProcessPlayer:
         # 循环播放开关
         self.loop_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(toolbar, text="Loop", variable=self.loop_var).pack(side=tk.LEFT, padx=3)
+
+        ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8, pady=2)
+
+        # Scale 切换
+        ttk.Label(toolbar, text="Scale:").pack(side=tk.LEFT, padx=(5, 2))
+        self.scale_var = tk.StringVar(value=self.scale.capitalize())
+        scale_combo = ttk.Combobox(toolbar, textvariable=self.scale_var,
+                                    values=["Linear", "Log"], state="readonly", width=7)
+        scale_combo.pack(side=tk.LEFT, padx=2)
+        scale_combo.bind("<<ComboboxSelected>>", lambda e: self._switch_scale())
 
     def _create_plot_area(self):
         self.fig = Figure(figsize=(14, 8), facecolor='#1a1a2e')
@@ -786,23 +798,20 @@ class PostProcessPlayer:
     def _show_cartesian_frame(self, dirty_img, ts, n_channels, peak_info):
         """显示 Cartesian 帧"""
         l_max = np.sin(np.radians(self.fov_deg / 2))
-        m_axis = np.linspace(l_max, -l_max, dirty_img.shape[0])
 
         self.im_dirty.set_extent([-l_max, l_max, -l_max, l_max])
         self.im_dirty.set_data(dirty_img)
 
-        valid = dirty_img[dirty_img != 0]
-        if len(valid) > 0:
-            vmin = float(np.percentile(valid, 2))
-            vmax = float(np.percentile(valid, 98))
-            if vmax <= vmin:
-                vmax = vmin + 1e-6
-            self.im_dirty.set_clim(vmin, vmax)
+        # 根据 scale 设置归一化
+        norm, _, _ = compute_display_norm(dirty_img, scale=self.scale)
+        self.im_dirty.set_norm(norm)
+        self.cbar.update_normal(self.im_dirty)
 
         rfi_note = self._rfi_status(n_channels)
+        scale_note = " [LOG]" if self.scale == "log" else ""
         self.ax_dirty.set_title(
             f"Dirty Image — {self.freq_mhz:.0f} MHz  FOV={self.fov_deg:.0f}°  "
-            f"Ch: {n_channels}/8{rfi_note} [CPU]\n"
+            f"Ch: {n_channels}/8{rfi_note}{scale_note} [CPU]\n"
             f"Timestamp: {ts}  |  Grid: {self.grid_pts}×{self.grid_pts}",
             color='white', fontsize=11
         )
@@ -829,23 +838,20 @@ class PostProcessPlayer:
 
         self.im_dirty.set_array(dirty_img.ravel())
 
-        valid = dirty_img[dirty_img != 0]
-        if len(valid) > 0:
-            vmin = float(np.percentile(valid, 2))
-            vmax = float(np.percentile(valid, 98))
-            if vmax <= vmin:
-                vmax = vmin + 1e-6
-            self.im_dirty.set_clim(vmin, vmax)
-            self.cbar.mappable.set_clim(vmin, vmax)
+        # 根据 scale 设置归一化
+        norm, _, _ = compute_display_norm(dirty_img, scale=self.scale)
+        self.im_dirty.set_norm(norm)
+        self.cbar.update_normal(self.im_dirty)
 
         rfi_note = self._rfi_status(n_channels)
+        scale_note = " [LOG]" if self.scale == "log" else ""
         if self.imaging_mode == "polar_cpu":
             backend_note = " [POLAR_CPU]"
         else:
             backend_note = " [GPU]"
         self.ax_dirty.set_title(
             f"All-Sky Dirty Image — {self.freq_mhz:.0f} MHz  "
-            f"Ch: {n_channels}/8{rfi_note}{backend_note}\n"
+            f"Ch: {n_channels}/8{rfi_note}{scale_note}{backend_note}\n"
             f"Timestamp: {ts}  |  Grid: {nr}×{na} polar",
             color='white', fontsize=11
         )
@@ -951,6 +957,15 @@ class PostProcessPlayer:
         except ValueError:
             pass
 
+    def _switch_scale(self):
+        """切换 Linear / Log 显示 scale"""
+        new_scale = self.scale_var.get().lower()
+        if new_scale == self.scale:
+            return
+        self.scale = new_scale
+        # Re-show current frame with new scale
+        self._show_frame(self.current_frame_idx)
+
     def _reset_clim(self):
         if self.im_dirty is not None:
             self.im_dirty.autoscale()
@@ -999,6 +1014,8 @@ def main():
                              '1 = legacy single-channel)')
     parser.add_argument('--mode', choices=['cpu', 'gpu', 'polar_cpu'], default='cpu',
                         help='Imaging mode: cpu (Cartesian l,m), gpu (Polar CuPy), polar_cpu (Polar C/OpenMP)')
+    parser.add_argument('--scale', choices=['linear', 'log'], default='linear',
+                        help='Display scale: linear or log (default: linear)')
     parser.add_argument('--interval', type=float, default=0.5,
                         help='Playback interval between frames in seconds (default: 0.5)')
 
@@ -1026,6 +1043,7 @@ def main():
     print(f"  Grid:          {args.grid}×{args.grid}")
     print(f"  Broadband ch:  {args.nch}")
     print(f"  Play interval: {args.interval}s")
+    print(f"  Display scale: {args.scale}")
     print(f"  Imaging mode:  {args.mode.upper()}")
     print(f"  GPU available: {'YES' if gpu_avail else 'NO'}")
     print("=" * 65)
@@ -1040,7 +1058,8 @@ def main():
         antennas_file=args.antennas,
         n_channels=args.nch,
         imaging_mode=args.mode,
-        play_interval=args.interval
+        play_interval=args.interval,
+        scale=args.scale
     )
     player.run()
 

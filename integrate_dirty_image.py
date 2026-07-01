@@ -63,6 +63,7 @@ from make_dirty_image import (
     _direct_fourier_sum_cpu,
     build_lm_grid,
     build_polar_sky_grid_GPU,
+    compute_display_norm,
 )
 
 
@@ -477,7 +478,7 @@ def save_integrated_image(dirty_img, date_str, method, imaging_mode,
                           freq_mhz, fov_deg, grid_pts, output_dir,
                           antennas=None, antennas_file=None,
                           n_channels=40, freq_sky_mhz=None,
-                          verbose=True):
+                          scale="linear", verbose=True):
     """
     保存积分脏图为 PNG 和 NPY，附带 UV 覆盖图。
 
@@ -563,24 +564,22 @@ def save_integrated_image(dirty_img, date_str, method, imaging_mode,
         ax.set_xticks([])
         ax.set_yticks([])
 
-        # 绘图
-        valid = dirty_img[dirty_img != 0]
-        vmin = float(np.percentile(valid, 2)) if len(valid) > 0 else 0.0
-        vmax = float(np.percentile(valid, 98)) if len(valid) > 0 else 1.0
-        if vmax <= vmin:
-            vmax = vmin + 1e-6
+        # 绘图 — 使用 compute_display_norm 支持 linear/log scale
+        norm, _, _ = compute_display_norm(dirty_img, scale=scale)
 
         im = ax.pcolormesh(X_edges, Y_edges, dirty_img,
                            cmap='inferno', shading='flat',
-                           vmin=vmin, vmax=vmax, rasterized=True)
+                           norm=norm, rasterized=True)
 
-        cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label='Intensity')
+        cbar_label = 'Intensity (log₁₀)' if scale == 'log' else 'Intensity'
+        cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label=cbar_label)
         cbar.ax.yaxis.label.set_color('white')
         cbar.ax.tick_params(colors='white')
 
+        scale_note = " [LOG]" if scale == "log" else ""
         bw_label = get_bandwidth_label(freq_mhz, n_channels, freq_sky_mhz)
         title = (f"Integrated All-Sky Dirty Image — {date_str}\n"
-                 f"Method: {method.upper()}  |  {bw_label}  |  "
+                 f"Method: {method.upper()}  |  {bw_label}{scale_note}  |  "
                  f"FOV={fov_deg:.0f}°  |  Grid: {nr}×{na} polar")
         ax.set_title(title, color='white', fontsize=13)
 
@@ -591,17 +590,15 @@ def save_integrated_image(dirty_img, date_str, method, imaging_mode,
             ax = fig.add_subplot(111, facecolor='black')
         ax.set_aspect('equal')
 
-        valid = dirty_img[dirty_img != 0]
-        vmin = float(np.percentile(valid, 2)) if len(valid) > 0 else 0.0
-        vmax = float(np.percentile(valid, 98)) if len(valid) > 0 else 1.0
-        if vmax <= vmin:
-            vmax = vmin + 1e-6
+        # 绘图 — 使用 compute_display_norm 支持 linear/log scale
+        norm, _, _ = compute_display_norm(dirty_img, scale=scale)
 
         im = ax.imshow(dirty_img, extent=[-l_max, l_max, -l_max, l_max],
                        origin='upper', cmap='inferno', aspect='equal',
-                       interpolation='bilinear', vmin=vmin, vmax=vmax)
+                       interpolation='bilinear', norm=norm)
 
-        cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label='Intensity')
+        cbar_label = 'Intensity (log₁₀)' if scale == 'log' else 'Intensity'
+        cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label=cbar_label)
         cbar.ax.yaxis.label.set_color('white')
         cbar.ax.tick_params(colors='white')
 
@@ -609,9 +606,10 @@ def save_integrated_image(dirty_img, date_str, method, imaging_mode,
         ax.set_ylabel("m (South-North)", color='white')
         ax.tick_params(colors='white', labelsize=8)
 
+        scale_note = " [LOG]" if scale == "log" else ""
         bw_label = get_bandwidth_label(freq_mhz, n_channels, freq_sky_mhz)
         title = (f"Integrated Dirty Image — {date_str}\n"
-                 f"Method: {method.upper()}  |  {bw_label}  |  "
+                 f"Method: {method.upper()}  |  {bw_label}{scale_note}  |  "
                  f"FOV={fov_deg:.0f}°  |  Grid: {grid_pts}×{grid_pts}")
         ax.set_title(title, color='white', fontsize=13)
 
@@ -784,6 +782,8 @@ def main():
                         help='Observer longitude in degrees (default: 116)')
     parser.add_argument('--output', default='integrated_images',
                         help='Output directory (default: integrated_images)')
+    parser.add_argument('--scale', choices=['linear', 'log'], default='linear',
+                        help='Display scale: linear or log (default: linear)')
     parser.add_argument('--no-rfi', action='store_true',
                         help='Disable RFI filtering')
 
@@ -857,7 +857,8 @@ def main():
             dirty, date_str, method, args.mode,
             args.freq, args.fov, args.grid, args.output,
             antennas_file=args.antennas,
-            n_channels=args.nch
+            n_channels=args.nch,
+            scale=args.scale
         )
 
     total_elapsed = time.time() - total_start
