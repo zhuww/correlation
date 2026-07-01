@@ -45,7 +45,10 @@ from make_dirty_image import (make_dirty_image_cpu,
                                read_frequency_range_from_data,
                                load_broadband_visibilities,
                                get_bandwidth_label,
-                               compute_display_norm)
+                               compute_display_norm,
+                               _cached_baseline,
+                               apply_baseline_correction,
+                               _baseline_cache)
 
 
 # ==============================================================================
@@ -169,7 +172,8 @@ class RealtimeDirtyImageApp:
                  freq_mhz=150.0, fov_deg=30.0, grid_pts=256,
                  antennas_file="optimized_antenna_coordinates.txt",
                  save_images=True, output_dir="dirty_image_frames",
-                 imaging_mode="cpu", n_channels=10, scale="linear"):
+                 imaging_mode="cpu", n_channels=10, scale="linear",
+                 subtract_baseline=False):
         self.watch_dir = Path(watch_dir)
         self.refresh_interval = refresh_interval
         self.freq_mhz = freq_mhz
@@ -182,6 +186,7 @@ class RealtimeDirtyImageApp:
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.imaging_mode = imaging_mode  # "cpu" or "gpu"
+        self.subtract_baseline = subtract_baseline
 
         self.loader = VisibilityLoader(watch_dir)
         self.last_timestamp = None
@@ -305,6 +310,12 @@ class RealtimeDirtyImageApp:
         self.save_var = tk.BooleanVar(value=self.save_images)
         ttk.Checkbutton(toolbar, text="Save PNG", variable=self.save_var,
                         command=lambda: setattr(self, 'save_images', self.save_var.get())
+                        ).pack(side=tk.LEFT, padx=3)
+
+        # 基准校正开关
+        self.baseline_var = tk.BooleanVar(value=self.subtract_baseline)
+        ttk.Checkbutton(toolbar, text="Baseline Correction", variable=self.baseline_var,
+                        command=lambda: self._toggle_baseline()
                         ).pack(side=tk.LEFT, padx=3)
 
         ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8, pady=2)
@@ -693,11 +704,15 @@ class RealtimeDirtyImageApp:
                     horizon_mask = horizon_mask & fov_mask
                 dirty_img = np.zeros((n_radial, n_azimuthal), dtype=np.float64)
             else:
+                n_radial, n_azimuthal = None, None
                 L, M, N, horizon_mask, _, _ = build_lm_grid(
                     grid_pts=self.grid_pts, fov_deg=self.fov_deg
                 )
                 dirty_img = np.zeros((self.grid_pts, self.grid_pts),
                                      dtype=np.float64)
+
+            # Per-channel baseline accumulator (only if correction enabled)
+            baseline_acc = np.zeros_like(dirty_img) if self.subtract_baseline else None
 
             for ci in range(self.n_channels):
                 vis = vis_all[ci]
@@ -716,7 +731,23 @@ class RealtimeDirtyImageApp:
                 )
                 dirty_img += ch_dirty
 
+                # Accumulate per-channel baseline
+                if self.subtract_baseline:
+                    bl = _cached_baseline(
+                        L, M, N, horizon_mask,
+                        bu, bv, bw, True,
+                        n_radial=n_radial, n_azimuthal=n_azimuthal
+                    )
+                    baseline_acc += bl
+
             dirty_img /= self.n_channels
+
+            # Apply broadband baseline correction
+            if self.subtract_baseline and baseline_acc is not None:
+                baseline_acc /= self.n_channels
+                dirty_img = apply_baseline_correction(
+                    dirty_img, baseline_acc, method='relative_excess'
+                )
 
             bw_label = get_bandwidth_label(self.freq_mhz, self.n_channels,
                                            freq_sky_mhz)
@@ -756,10 +787,10 @@ class RealtimeDirtyImageApp:
         m_min, m_max = m_axis[-1], m_axis[0]
 
         self.im_dirty.set_extent([-l_max, l_max, m_min, m_max])
-        self.im_dirty.set_data(dirty_img)
 
-        # 根据 scale 设置归一化
-        norm, _, _ = compute_display_norm(dirty_img, scale=self.scale)
+        # 根据 scale 变换数据并设置归一化
+        display_data, norm, _, _ = compute_display_norm(dirty_img, scale=self.scale)
+        self.im_dirty.set_data(display_data)
         self.im_dirty.set_norm(norm)
         self.cbar.update_normal(self.im_dirty)
 
@@ -799,8 +830,9 @@ class RealtimeDirtyImageApp:
 
         self.im_dirty.set_array(dirty_img.ravel())
 
-        # 根据 scale 设置归一化
-        norm, _, _ = compute_display_norm(dirty_img, scale=self.scale)
+        # 根据 scale 变换数据并设置归一化
+        display_data, norm, _, _ = compute_display_norm(dirty_img, scale=self.scale)
+        self.im_dirty.set_array(display_data.ravel())
         self.im_dirty.set_norm(norm)
         self.cbar.update_normal(self.im_dirty)
 
@@ -929,6 +961,14 @@ class RealtimeDirtyImageApp:
         self.last_timestamp = None
         self.refresh()
 
+    def _toggle_baseline(self):
+        """切换基准校正开关，清除缓存并刷新"""
+        was = self.subtract_baseline
+        self.subtract_baseline = self.baseline_var.get()
+        if was != self.subtract_baseline:
+            self.last_timestamp = None
+            self.refresh()
+
     def _set_freq_bin(self, idx):
         self.loader.freq_bin_idx = idx
         self.last_timestamp = None
@@ -987,6 +1027,9 @@ def main():
                         help='Imaging mode: cpu (Cartesian l,m), gpu (Polar CuPy), polar_cpu (Polar C/OpenMP)')
     parser.add_argument('--scale', choices=['linear', 'log'], default='linear',
                         help='Display scale: linear or log (default: linear)')
+    parser.add_argument('--subtract-baseline', action='store_true',
+                        help='Enable uniform-sky baseline correction to remove '
+                             'edge-brightening artifact')
 
     args = parser.parse_args()
 
@@ -1053,7 +1096,8 @@ def main():
         output_dir=args.output,
         imaging_mode=args.mode,
         n_channels=args.nch,
-        scale=args.scale
+        scale=args.scale,
+        subtract_baseline=args.subtract_baseline
     )
     app.run()
 

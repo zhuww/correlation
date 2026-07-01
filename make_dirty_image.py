@@ -1776,12 +1776,75 @@ def transform_display_data(dirty_img, scale="linear"):
         return dirty_img, "Intensity"
 
 
+def log_transform_dirty(dirty_img, linthresh=None):
+    """
+    Apply log10 transform to dirty image data for display.
+
+    This actually changes the *pixel values*, so when displayed with a linear
+    color scale, faint features become visible against bright ones — unlike
+    SymLogNorm which only relabels the colorbar without altering the image.
+
+    Transform:
+        for |x| >= linthresh:  y = sign(x) * log10(|x| / linthresh)
+        for |x| <  linthresh:  y = x / linthresh  (linear ramp through zero)
+
+    Parameters
+    ----------
+    dirty_img : ndarray
+        Raw dirty image data (may contain negatives).
+    linthresh : float or None
+        Threshold below which the response is linear.
+        If None, auto: 1st percentile of positive values, min 1e-6 * vmax.
+
+    Returns
+    -------
+    log_img : ndarray, same shape as dirty_img
+        Log-transformed data ready for linear-scale display.
+    range_min, range_max : float
+        Percentile-based data range of the log-transformed image
+        (suitable for vmin/vmax in a Linear Normalize).
+    """
+    valid = dirty_img[dirty_img != 0]
+    if len(valid) == 0:
+        return np.zeros_like(dirty_img), 0.0, 1.0
+
+    abs_max = float(np.max(np.abs(valid)))
+
+    if linthresh is None:
+        pos = valid[valid > 0]
+        if len(pos) > 0:
+            linthresh = max(float(np.percentile(pos, 1)), abs_max * 1e-6)
+        else:
+            linthresh = abs_max * 1e-4
+
+    abs_data = np.abs(dirty_img)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        log_img = np.where(
+            abs_data >= linthresh,
+            np.sign(dirty_img) * np.log10(abs_data / linthresh),
+            dirty_img / linthresh
+        )
+
+    # Compute display range from percentiles of log-transformed data
+    log_valid = log_img[log_img != 0]
+    if len(log_valid) > 0:
+        vmin = float(np.percentile(log_valid, 2))
+        vmax = float(np.percentile(log_valid, 98))
+    else:
+        vmin, vmax = 0.0, 1.0
+    if vmax <= vmin:
+        vmax = vmin + 1e-6
+
+    return log_img, vmin, vmax
+
+
 def compute_display_norm(dirty_img, scale="linear", linthresh=None):
     """
-    Compute an appropriate matplotlib Normalize object for the display scale.
+    Compute display data and Normalize object for the chosen scale.
 
-    Uses percentiles to set vmin/vmax for linear, and SymLogNorm for log scale
-    (which handles negative values gracefully with a linear region around zero).
+    For "linear": returns the raw data with percentile-based Normalize.
+    For "log":    returns log10-transformed data with linear Normalize.
+                  This actually changes pixel values, not just the colorbar.
 
     Parameters
     ----------
@@ -1790,34 +1853,30 @@ def compute_display_norm(dirty_img, scale="linear", linthresh=None):
     scale : str
         "linear" or "log".
     linthresh : float or None
-        Linear threshold for SymLogNorm. If None, auto-computed from data.
+        For "log": threshold below which response is linear.
+        If None, auto-computed.
 
     Returns
     -------
+    display_data : ndarray, same shape as dirty_img
+        The data to actually display (raw or log-transformed).
     norm : matplotlib.colors.Normalize
+        Normalize object for the display data.
     vmin, vmax : float
         The computed data range.
     """
-    from matplotlib.colors import Normalize, SymLogNorm
-
-    valid = dirty_img[dirty_img != 0]
-    if len(valid) > 0:
-        vmin = float(np.percentile(valid, 2))
-        vmax = float(np.percentile(valid, 98))
-    else:
-        vmin, vmax = 0.0, 1.0
-    if vmax <= vmin:
-        vmax = vmin + 1e-6
+    from matplotlib.colors import Normalize
 
     if scale == "log":
-        if linthresh is None:
-            # Auto: use ~1% of the positive dynamic range
-            pos = valid[valid > 0]
-            if len(pos) > 0:
-                p1 = float(np.percentile(pos, 1))
-                linthresh = max(p1, 1e-6 * vmax)
-            else:
-                linthresh = vmax * 1e-4
-        return SymLogNorm(linthresh=linthresh, vmin=vmin, vmax=vmax, base=10), vmin, vmax
+        display_data, vmin, vmax = log_transform_dirty(dirty_img, linthresh)
+        return display_data, Normalize(vmin=vmin, vmax=vmax), vmin, vmax
     else:
-        return Normalize(vmin=vmin, vmax=vmax), vmin, vmax
+        valid = dirty_img[dirty_img != 0]
+        if len(valid) > 0:
+            vmin = float(np.percentile(valid, 2))
+            vmax = float(np.percentile(valid, 98))
+        else:
+            vmin, vmax = 0.0, 1.0
+        if vmax <= vmin:
+            vmax = vmin + 1e-6
+        return dirty_img, Normalize(vmin=vmin, vmax=vmax), vmin, vmax

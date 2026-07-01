@@ -565,9 +565,9 @@ def save_integrated_image(dirty_img, date_str, method, imaging_mode,
         ax.set_yticks([])
 
         # 绘图 — 使用 compute_display_norm 支持 linear/log scale
-        norm, _, _ = compute_display_norm(dirty_img, scale=scale)
+        display_data, norm, _, _ = compute_display_norm(dirty_img, scale=scale)
 
-        im = ax.pcolormesh(X_edges, Y_edges, dirty_img,
+        im = ax.pcolormesh(X_edges, Y_edges, display_data,
                            cmap='inferno', shading='flat',
                            norm=norm, rasterized=True)
 
@@ -591,9 +591,9 @@ def save_integrated_image(dirty_img, date_str, method, imaging_mode,
         ax.set_aspect('equal')
 
         # 绘图 — 使用 compute_display_norm 支持 linear/log scale
-        norm, _, _ = compute_display_norm(dirty_img, scale=scale)
+        display_data, norm, _, _ = compute_display_norm(dirty_img, scale=scale)
 
-        im = ax.imshow(dirty_img, extent=[-l_max, l_max, -l_max, l_max],
+        im = ax.imshow(display_data, extent=[-l_max, l_max, -l_max, l_max],
                        origin='upper', cmap='inferno', aspect='equal',
                        interpolation='bilinear', norm=norm)
 

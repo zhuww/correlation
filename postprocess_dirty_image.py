@@ -43,7 +43,10 @@ from make_dirty_image import (make_dirty_image_cpu,
                               read_frequency_range_from_data,
                               load_broadband_visibilities,
                               get_bandwidth_label,
-                              compute_display_norm)
+                              compute_display_norm,
+                              _cached_baseline,
+                              apply_baseline_correction,
+                              _baseline_cache)
 
 
 # ==============================================================================
@@ -155,7 +158,8 @@ class PostProcessPlayer:
                  freq_mhz=150.0, fov_deg=180.0, grid_pts=256,
                  antennas_file="optimized_antenna_coordinates.txt",
                  n_channels=20, imaging_mode="cpu",
-                 play_interval=0.5, scale="linear"):
+                 play_interval=0.5, scale="linear",
+                 subtract_baseline=False):
         self.watch_dir = Path(watch_dir)
         self.freq_mhz = freq_mhz
         self.fov_deg = fov_deg
@@ -165,6 +169,7 @@ class PostProcessPlayer:
         self.imaging_mode = imaging_mode
         self.play_interval = play_interval  # 播放间隔（秒）
         self.scale = scale  # "linear" or "log"
+        self.subtract_baseline = subtract_baseline
 
         # 帧数据
         self.frame_timestamps = []       # 有序时间戳列表
@@ -290,6 +295,14 @@ class PostProcessPlayer:
         # 循环播放开关
         self.loop_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(toolbar, text="Loop", variable=self.loop_var).pack(side=tk.LEFT, padx=3)
+
+        ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8, pady=2)
+
+        # 基准校正开关
+        self.baseline_var = tk.BooleanVar(value=self.subtract_baseline)
+        ttk.Checkbutton(toolbar, text="Baseline Correction", variable=self.baseline_var,
+                        command=lambda: self._toggle_baseline()
+                        ).pack(side=tk.LEFT, padx=3)
 
         ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8, pady=2)
 
@@ -646,11 +659,15 @@ class PostProcessPlayer:
                         horizon_mask = horizon_mask & fov_mask
                     dirty_img = np.zeros((n_radial, n_azimuthal), dtype=np.float64)
                 else:
+                    n_radial, n_azimuthal = None, None
                     L, M, N, horizon_mask, _, _ = build_lm_grid(
                         grid_pts=self.grid_pts, fov_deg=self.fov_deg
                     )
                     dirty_img = np.zeros((self.grid_pts, self.grid_pts),
                                          dtype=np.float64)
+
+                # Per-channel baseline accumulator
+                baseline_acc = np.zeros_like(dirty_img) if self.subtract_baseline else None
 
                 for ci in range(self.n_channels):
                     vis = vis_all[ci]
@@ -671,7 +688,23 @@ class PostProcessPlayer:
                     )
                     dirty_img += ch_dirty
 
+                    # Accumulate per-channel baseline
+                    if self.subtract_baseline:
+                        bl = _cached_baseline(
+                            L, M, N, horizon_mask,
+                            bu, bv, bw, True,
+                            n_radial=n_radial, n_azimuthal=n_azimuthal
+                        )
+                        baseline_acc += bl
+
                 dirty_img /= self.n_channels
+
+                # Apply broadband baseline correction
+                if self.subtract_baseline and baseline_acc is not None:
+                    baseline_acc /= self.n_channels
+                    dirty_img = apply_baseline_correction(
+                        dirty_img, baseline_acc, method='relative_excess'
+                    )
 
                 # 计算活跃天线通道数
                 n_active_ant = int(np.sum(np.any(
@@ -800,10 +833,10 @@ class PostProcessPlayer:
         l_max = np.sin(np.radians(self.fov_deg / 2))
 
         self.im_dirty.set_extent([-l_max, l_max, -l_max, l_max])
-        self.im_dirty.set_data(dirty_img)
 
-        # 根据 scale 设置归一化
-        norm, _, _ = compute_display_norm(dirty_img, scale=self.scale)
+        # 根据 scale 变换数据并设置归一化
+        display_data, norm, _, _ = compute_display_norm(dirty_img, scale=self.scale)
+        self.im_dirty.set_data(display_data)
         self.im_dirty.set_norm(norm)
         self.cbar.update_normal(self.im_dirty)
 
@@ -838,8 +871,9 @@ class PostProcessPlayer:
 
         self.im_dirty.set_array(dirty_img.ravel())
 
-        # 根据 scale 设置归一化
-        norm, _, _ = compute_display_norm(dirty_img, scale=self.scale)
+        # 根据 scale 变换数据并设置归一化
+        display_data, norm, _, _ = compute_display_norm(dirty_img, scale=self.scale)
+        self.im_dirty.set_array(display_data.ravel())
         self.im_dirty.set_norm(norm)
         self.cbar.update_normal(self.im_dirty)
 
@@ -966,6 +1000,15 @@ class PostProcessPlayer:
         # Re-show current frame with new scale
         self._show_frame(self.current_frame_idx)
 
+    def _toggle_baseline(self):
+        """切换基准校正开关，需要重新处理"""
+        was = self.subtract_baseline
+        self.subtract_baseline = self.baseline_var.get()
+        if was != self.subtract_baseline:
+            self.playing = False
+            self.play_btn.config(text="▶ Play")
+            self._rescan()
+
     def _reset_clim(self):
         if self.im_dirty is not None:
             self.im_dirty.autoscale()
@@ -1016,6 +1059,9 @@ def main():
                         help='Imaging mode: cpu (Cartesian l,m), gpu (Polar CuPy), polar_cpu (Polar C/OpenMP)')
     parser.add_argument('--scale', choices=['linear', 'log'], default='linear',
                         help='Display scale: linear or log (default: linear)')
+    parser.add_argument('--subtract-baseline', action='store_true',
+                        help='Enable uniform-sky baseline correction to remove '
+                             'edge-brightening artifact')
     parser.add_argument('--interval', type=float, default=0.5,
                         help='Playback interval between frames in seconds (default: 0.5)')
 
@@ -1059,7 +1105,8 @@ def main():
         n_channels=args.nch,
         imaging_mode=args.mode,
         play_interval=args.interval,
-        scale=args.scale
+        scale=args.scale,
+        subtract_baseline=args.subtract_baseline
     )
     player.run()
 
