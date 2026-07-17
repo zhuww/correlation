@@ -31,13 +31,17 @@ import pandas as pd
 
 # ── 中文字体 ──
 for fname in fm.findSystemFonts(fontpaths=None, fontext='ttf'):
-    prop = fm.FontProperties(fname=fname)
-    if 'SimHei' in prop.get_name() or 'Microsoft YaHei' in prop.get_name():
-        plt.rcParams['font.sans-serif'] = [prop.get_name(), 'DejaVu Sans']
+    try:
+        prop = fm.FontProperties(fname=fname)
+        name = prop.get_name()
+    except Exception:
+        continue
+    if 'SimHei' in name or 'Microsoft YaHei' in name:
+        plt.rcParams['font.sans-serif'] = [name, 'DejaVu Sans']
         plt.rcParams['axes.unicode_minus'] = False
         break
 else:
-    plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
+    plt.rcParams['font.sans-serif'] = ['DejaVu Sans']
     plt.rcParams['axes.unicode_minus'] = False
 
 
