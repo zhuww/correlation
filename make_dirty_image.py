@@ -5,7 +5,10 @@ from pathlib import Path
 # ASTROPHYSICAL CONTEXT & PROJECT CONTEXT NOTE
 # ==============================================================================
 # - PROJECT DESIGN LAYOUT: 8-element antenna array.
-# - BANDWIDTH / FREQUENCY: 100 - 200 MHz (wavelength lambda ≈ 1.5m to 3.0m).
+# - FREQUENCY: 4096 FFT bins, 100 - 200 MHz (center 150 MHz, wavelength 1.5-3.0m).
+#   CSV frequency_hz column = baseband (-50~+50 MHz), sky_freq = 150 + f_hz/1e6.
+#   Bin arrangement: first 2049 bins 150→200 MHz, last 2047 bins 100→150 MHz.
+#   Each bin bandwidth ≈ 100 MHz/4096 ≈ 24.4 kHz.
 # - GEOMETRIC CONSTRAINT: Maximum baseline limited strictly to < 30 meters.
 # - OBSERVATIONAL LIMIT: Designed for sky imaging of the Sun and celestial radio
 #   sources. All-sky imaging is the primary goal.
@@ -334,7 +337,7 @@ def _direct_fourier_sum_cpu(L, M, N, baselines_u, baselines_v, baselines_w,
 
         acc += vis_re[k] * np.cos(phase) - vis_im[k] * np.sin(phase)
 
-    norm_factor = 28.5
+    norm_factor = n_baselines + 0.5
     dirty = np.zeros_like(L)
 
     if apply_w_correction:
@@ -558,7 +561,7 @@ def _direct_fourier_sum_GPU(L, M, N, baselines_u, baselines_v, baselines_w,
         acc += vr_g[k] * xp.cos(phase) - vi_g[k] * xp.sin(phase)
 
     # Apply primary beam correction (1/N) and normalization
-    norm_factor = xp.float64(28.5)
+    norm_factor = xp.float64(n_baselines + 0.5)
 
     if apply_w_correction:
         # Divide by n = sqrt(1 - l^2 - m^2) for primary beam correction.
@@ -579,6 +582,78 @@ def _direct_fourier_sum_GPU(L, M, N, baselines_u, baselines_v, baselines_w,
     acc[~xp.asarray(horizon_mask)] = xp.float64(0.0)
 
     return _asnumpy(acc)
+
+
+def _fourier_sum_gpu_tracked(L_g, M_g, N_g, hm_g,
+                              baselines_u, baselines_v, baselines_w,
+                              vis_re, vis_im, auto_corr_sum,
+                              apply_w_correction):
+    """
+    GPU Fourier sum 批量优化版：所有基线一次广播计算，无 Python 循环。
+
+    专为 tracked 模式设计：sky grid 在 GPU 上驻留，每帧×通道只上传
+    baseline/visibility 数据，累积结果留在 GPU，最后一次性下载。
+
+    Parameters
+    ----------
+    L_g, M_g, N_g, hm_g : cupy.ndarray (float64), shape (nrad, naz)
+        预加载到 GPU 的天空网格和地平线掩码。
+    baselines_u/v/w : ndarray (float64), shape (nbl,)
+        CPU 上的基线坐标。
+    vis_re/im : ndarray (float64), shape (nbl,)
+        CPU 上的可见度实部/虚部。
+    auto_corr_sum : float
+    apply_w_correction : bool
+
+    Returns
+    -------
+    dirty_g : cupy.ndarray (float64)
+        GPU 上的脏图（调用方负责累积和最终下载）。
+    """
+    xp = cp
+    n_baselines = len(baselines_u)
+
+    # 上传到 GPU
+    u_g = xp.asarray(baselines_u, dtype=xp.float64)
+    v_g = xp.asarray(baselines_v, dtype=xp.float64)
+    w_g = xp.asarray(baselines_w, dtype=xp.float64)
+    vr_g = xp.asarray(vis_re, dtype=xp.float64)
+    vi_g = xp.asarray(vis_im, dtype=xp.float64)
+
+    two_pi = xp.float64(2.0 * 3.141592653589793)
+
+    # ── 批量广播：一次计算所有基线的相位 ──
+    # u_g: (nbl,) → (nbl, 1, 1); L_g: (nrad, naz) → (1, nrad, naz)
+    u_b = u_g[:, None, None]    # (nbl, 1, 1)
+    v_b = v_g[:, None, None]    # (nbl, 1, 1)
+    L_b = L_g[None, :, :]       # (1, nrad, naz)
+    M_b = M_g[None, :, :]       # (1, nrad, naz)
+
+    # phase: (nbl, nrad, naz) — 所有基线一次性求相位
+    phase = two_pi * (u_b * L_b + v_b * M_b)
+    if apply_w_correction:
+        w_b = w_g[:, None, None]        # (nbl, 1, 1)
+        N_b = N_g[None, :, :]           # (1, nrad, naz)
+        phase += two_pi * w_b * (N_b - 1.0)
+
+    # 批量可见度贡献: (nbl, nrad, naz) → sum over baselines → (nrad, naz)
+    vr_b = vr_g[:, None, None]  # (nbl, 1, 1)
+    vi_b = vi_g[:, None, None]  # (nbl, 1, 1)
+    acc = xp.full(L_g.shape, auto_corr_sum, dtype=xp.float64)
+    acc += xp.sum(vr_b * xp.cos(phase) - vi_b * xp.sin(phase), axis=0)
+
+    # 归一化
+    norm = xp.float64(n_baselines + 0.5)
+    if apply_w_correction:
+        n_clipped = xp.maximum(N_g, xp.float64(1e-6))
+        valid = hm_g & (N_g > xp.float64(1e-3))
+        acc[valid] = (acc[valid] / n_clipped[valid]) / norm
+        acc[hm_g & ~valid] = xp.float64(0.0)
+    else:
+        acc[hm_g] = acc[hm_g] / norm
+
+    acc[~hm_g] = xp.float64(0.0)
+    return acc
 
 
 def make_dirty_image_GPU(antennas_filepath, visibilities,
@@ -1083,6 +1158,7 @@ def read_frequency_range_from_data(data_dir, center_freq_mhz=150.0):
 
     CSV files contain a 'frequency_hz' column with baseband frequencies.
     The actual sky frequency is center_freq_mhz + frequency_hz/1e6.
+    Sky frequencies range from ~100 to ~200 MHz (center = 150 MHz).
 
     Returns
     -------
@@ -1126,18 +1202,26 @@ def _get_channel_indices(pair_name):
 
 
 def load_broadband_visibilities(file_map, center_freq_mhz=150.0,
-                                n_channels=40, max_bins=4096):
+                                n_channels=0, max_bins=4096):
     """
     Read visibilities at multiple frequency channels from a set of CSV files.
+
+    数据说明:
+      CSV 的 frequency_hz 列记录基带频率 (Hz)，中心频率 150 MHz。
+      天空频率 = 150 MHz + frequency_hz/1e6。
+      4096 个 FFT bin: 前 2049 个 0→+50 MHz (150→200 MHz),
+      后 2047 个 -50 MHz→0 (100→150 MHz), Nyquist 处 wrap。
+      每个 bin 带宽 ≈ 100 MHz/4096 ≈ 24.4 kHz。
 
     Parameters
     ----------
     file_map : dict
         {pair_name: filepath} mapping for one frame.
     center_freq_mhz : float
-        Center sky frequency in MHz.
+        Center sky frequency in MHz (default: 150).
     n_channels : int
-        Number of evenly-spaced frequency channels to use.
+        Number of channels to use. 0 = all 4096 bins (correct physics),
+        >0 = evenly subsample n_channels bins from the full range.
     max_bins : int
         Maximum number of frequency bins in the CSV files.
 
@@ -1150,15 +1234,33 @@ def load_broadband_visibilities(file_map, center_freq_mhz=150.0,
     """
     import pandas as pd
 
-    if n_channels >= max_bins:
-        n_channels = max_bins
+    # ── 读取频率列获取总 bin 数 ──
+    first_file = next(iter(file_map.values()))
+    try:
+        df_freq = pd.read_csv(first_file, comment='#', usecols=['frequency_hz'])
+        f_base_hz = df_freq['frequency_hz'].values
+        actual_bins = len(f_base_hz)
+    except Exception:
+        f_base_hz = None
+        actual_bins = max_bins
 
-    # Evenly-spaced bin indices
-    bin_indices = np.linspace(0, max_bins - 1, n_channels, dtype=int)
+    # ── 确定使用的通道 ──
+    if n_channels <= 0 or n_channels >= actual_bins:
+        n_channels = actual_bins
+        bin_indices = np.arange(actual_bins, dtype=int)    # 全部 bin
+    else:
+        bin_indices = np.linspace(0, actual_bins - 1, n_channels, dtype=int)
 
     # Pre-allocate: (n_channels, 8 ant, 8 ant)
     vis_all = np.zeros((n_channels, 8, 8), dtype=np.complex128)
     freq_sky_mhz = np.zeros(n_channels, dtype=np.float64)
+
+    # 计算天空频率
+    if f_base_hz is not None:
+        for ci, bi in enumerate(bin_indices):
+            freq_sky_mhz[ci] = center_freq_mhz + f_base_hz[bi] / 1e6
+    else:
+        freq_sky_mhz[:] = center_freq_mhz
 
     # Cache CSV data to avoid repeated I/O
     csv_cache = {}
@@ -1171,19 +1273,6 @@ def load_broadband_visibilities(file_map, center_freq_mhz=150.0,
         except Exception:
             pass
 
-    # Also read frequency_hz from first file to get actual sky frequencies
-    first_file = next(iter(file_map.values()))
-    try:
-        df_freq = pd.read_csv(first_file, comment='#', usecols=['frequency_hz'])
-        f_base_hz = df_freq['frequency_hz'].values
-        for ci, bi in enumerate(bin_indices):
-            if bi < len(f_base_hz):
-                freq_sky_mhz[ci] = center_freq_mhz + f_base_hz[bi] / 1e6
-            else:
-                freq_sky_mhz[ci] = center_freq_mhz
-    except Exception:
-        freq_sky_mhz[:] = center_freq_mhz
-
     # Fill visibility matrices
     for ci, bi in enumerate(bin_indices):
         for pair_name, filepath in file_map.items():
@@ -1194,13 +1283,14 @@ def load_broadband_visibilities(file_map, center_freq_mhz=150.0,
             if df is None:
                 continue
             try:
-                actual_idx = df['frequency_index'].values[bi]
-                if actual_idx == bi:
-                    r = df.iloc[bi]
-                    val = complex(r['real_part'], r['imag_part'])
-                    vis_all[ci, row_idx, col_idx] = val
-                    if row_idx != col_idx:
-                        vis_all[ci, col_idx, row_idx] = val.conjugate()
+                if bi < len(df):
+                    actual_idx = df['frequency_index'].values[bi]
+                    if actual_idx == bi:
+                        r = df.iloc[bi]
+                        val = complex(r['real_part'], r['imag_part'])
+                        vis_all[ci, row_idx, col_idx] = val
+                        if row_idx != col_idx:
+                            vis_all[ci, col_idx, row_idx] = val.conjugate()
             except (IndexError, KeyError):
                 pass
 
@@ -1735,6 +1825,113 @@ def _cached_baseline(L, M, N, horizon_mask,
     return baseline
 
 
+# GPU baseline 缓存：dOmega 只算一次（天空网格不变）
+_dOmega_g_cache = None
+_dOmega_g_cache_shape = None
+
+
+def _get_dOmega_g(L_g, hm_g):
+    """返回 GPU 上的 dOmega 数组（缓存，仅首次计算）。"""
+    global _dOmega_g_cache, _dOmega_g_cache_shape
+    shape = L_g.shape
+    if _dOmega_g_cache is not None and _dOmega_g_cache_shape == shape:
+        return _dOmega_g_cache
+    xp = cp
+    nr, na = shape
+    d_zeta = xp.float64(np.radians(90.0) / nr)
+    d_phi = xp.float64(np.radians(360.0) / na)
+    zeta_rad = xp.linspace(0.0, xp.float64(np.radians(90.0)), nr, dtype=xp.float64)
+    sin_zeta = xp.sin(zeta_rad)
+    _dOmega_g_cache = xp.full((nr, na), sin_zeta[:, None] * d_zeta * d_phi,
+                              dtype=xp.float64)
+    _dOmega_g_cache_shape = shape
+    return _dOmega_g_cache
+
+
+def _compute_baseline_gpu(L_g, M_g, N_g, hm_g,
+                          bu, bv, bw,      # 28 baselines, no conjugates
+                          apply_w_correction):
+    """
+    GPU-accelerated baseline dirty image computation.
+    
+    等效于 compute_baseline_dirty_image 但全部密集运算在 GPU 上执行：
+      1. 正演均匀天空可见度（批量广播，GPU）
+      2. 构建 8×8 可见度矩阵（CPU，仅 56 元素）
+      3. 反傅里叶求和（GPU，复用 _fourier_sum_gpu_tracked）
+
+    Parameters
+    ----------
+    L_g, M_g, N_g, hm_g : cupy.ndarray, shape (nrad, naz)
+        预加载到 GPU 的天空网格。
+    bu, bv, bw : ndarray, shape (28,)
+        CPU 上的基线坐标（不含共轭）。
+    apply_w_correction : bool
+
+    Returns
+    -------
+    baseline_g : cupy.ndarray, shape (nrad, naz)
+        GPU 上的基准脏图。
+    """
+    xp = cp
+    n_baselines = len(bu)
+
+    dOmega_g = _get_dOmega_g(L_g, hm_g)
+
+    # ── Step 1: 正演均匀天空可见度（批量 GPU 广播）──
+    valid = hm_g & (N_g > xp.float64(1e-3))
+    auto_corr = float(xp.asnumpy(xp.sum(dOmega_g[valid]))) * 8.0 * 0.5
+
+    u_g = xp.asarray(bu, dtype=xp.float64)
+    v_g = xp.asarray(bv, dtype=xp.float64)
+    w_g = xp.asarray(bw, dtype=xp.float64)
+
+    u_b = u_g[:, None, None]   # (28, 1, 1)
+    v_b = v_g[:, None, None]
+    w_b = w_g[:, None, None]
+    L_b = L_g[None, :, :]      # (1, nr, na)
+    M_b = M_g[None, :, :]
+    N_b = N_g[None, :, :]
+    dO_b = dOmega_g[None, :, :]
+
+    two_pi = xp.float64(2.0 * 3.141592653589793)
+    phase = two_pi * (u_b * L_b + v_b * M_b)
+    if apply_w_correction:
+        phase += two_pi * w_b * (N_b - xp.float64(1.0))
+
+    val_b = valid[None, :, :]  # (1, nr, na)
+    # V_k = Σ_p e^{-i·phase} · dΩ_p = Σ[cos·dΩ - i·sin·dΩ]
+    cos_int = xp.where(val_b, xp.cos(phase) * dO_b, xp.float64(0.0))
+    sin_int = xp.where(val_b, -xp.sin(phase) * dO_b, xp.float64(0.0))
+    vis_re_fwd = xp.sum(cos_int, axis=(1, 2))   # (28,)
+    vis_im_fwd = xp.sum(sin_int, axis=(1, 2))   # (28,)
+
+    # ── Step 2: 构建 8×8 可见度矩阵（CPU）──
+    vis_re_cpu = xp.asnumpy(vis_re_fwd)
+    vis_im_cpu = xp.asnumpy(vis_im_fwd)
+    vis_cross = vis_re_cpu + 1j * vis_im_cpu
+
+    V = np.zeros((8, 8), dtype=np.complex128)
+    diag_val = auto_corr / 4.0
+    np.fill_diagonal(V, diag_val)
+    idx = 0
+    for i in range(8):
+        for j in range(i + 1, 8):
+            V[i, j] = vis_cross[idx]
+            V[j, i] = np.conj(vis_cross[idx])
+            idx += 1
+
+    # ── Step 3: 反傅里叶求和（GPU）──
+    vis_re, vis_im, auto_from_extract = _extract_visibility_data(V)
+    baseline_g = _fourier_sum_gpu_tracked(
+        L_g, M_g, N_g, hm_g,
+        bu, bv, bw,             # 28 基线，与 CPU baseline 一致
+        vis_re, vis_im, auto_from_extract,
+        apply_w_correction
+    )
+
+    return baseline_g
+
+
 def get_bandwidth_label(center_freq_mhz, n_channels, freq_sky_mhz=None):
     """Generate a bandwidth label string for display."""
     if n_channels <= 1:
@@ -1825,11 +2022,15 @@ def log_transform_dirty(dirty_img, linthresh=None):
             dirty_img / linthresh
         )
 
-    # Compute display range from percentiles of log-transformed data
-    log_valid = log_img[log_img != 0]
-    if len(log_valid) > 0:
-        vmin = float(np.percentile(log_valid, 2))
-        vmax = float(np.percentile(log_valid, 98))
+    # Compute display range from positive log-transformed values only.
+    # This prevents negative sidelobes from dominating the color scale
+    # and causing anomalous colors in log display mode.
+    log_pos = log_img[log_img > 0]
+    if len(log_pos) > 0:
+        vmax = float(np.percentile(log_pos, 98))
+        # Use a small fraction of vmax as floor, preserving ~2 orders of
+        # magnitude of dynamic range while sending negative values to dark.
+        vmin = max(0.0, vmax * 0.01)
     else:
         vmin, vmax = 0.0, 1.0
     if vmax <= vmin:

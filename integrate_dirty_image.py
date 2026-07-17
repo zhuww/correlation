@@ -6,6 +6,11 @@ Integrate Dirty Image — 同一天连续观测的时间积分天空成像
 将同一天内连续多个 frame 的可见度数据按基线累加（时间积分），生成一张
 信噪比更高的积分天空图像。
 
+数据说明:
+  CSV 的 frequency_hz 列为基带频率 (Hz), 天空频率 = 150 MHz + frequency_hz/1e6。
+  4096 个 FFT bin: 前 2049 个覆盖 150→200 MHz, 后 2047 个覆盖 100→150 MHz,
+  每 bin 带宽 ≈ 24.4 kHz。总频率范围 100~200 MHz。
+
 提供两种积分模式：
   1. **snapshot**  (不考虑天体位移)：将所有 frame 的可见度矩阵直接叠加取
      平均，等价于假设天空在观测期间静止不变。适用于积分时间较短或
@@ -40,6 +45,9 @@ import re
 import time
 import sys
 import argparse
+import os
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from collections import defaultdict
 from datetime import datetime, timedelta
 
@@ -65,8 +73,29 @@ from make_dirty_image import (
     build_polar_sky_grid_GPU,
     compute_display_norm,
     _cached_baseline,
+    _compute_baseline_gpu,
     apply_baseline_correction,
+    _fourier_sum_gpu_tracked,
 )
+
+# GPU 支持（可选）
+_GPU_AVAILABLE = False
+_cp = None
+_GPU_DEVICE_ID = 0
+try:
+    import cupy as _cp
+    # 自动选择 NVIDIA GPU
+    n_dev = _cp.cuda.runtime.getDeviceCount()
+    for i in range(n_dev):
+        name = _cp.cuda.runtime.getDeviceProperties(i)["name"].decode()
+        if "NVIDIA" in name.upper() or "GEFORCE" in name.upper() or "RTX" in name.upper():
+            _GPU_DEVICE_ID = i
+            break
+    _cp.cuda.Device(_GPU_DEVICE_ID).use()
+    _ = _cp.array([0.0])  # warm up
+    _GPU_AVAILABLE = True
+except Exception:
+    pass
 
 
 # ==============================================================================
@@ -121,6 +150,130 @@ def build_visibility_matrix_from_files(file_map, freq_bin_idx=0):
 
 
 # ==============================================================================
+# 时域 RFI 过滤：跨帧检测异常基线
+# ==============================================================================
+def filter_rfi_time_domain(frames_by_ts, freq_mhz, n_channels=40,
+                           sigma=4.0, window=31, verbose=True):
+    """
+    Time-domain RFI rejection: identify frames where baseline amplitudes are
+    anomalously high compared to a running median over neighbouring frames.
+
+    For each of the 28 cross-correlation baselines:
+    1. Extract |V| for all frequency channels across all frames → mean amplitude.
+    2. Apply a running-median filter (half-window) to compute local background.
+    3. Flag any frame where amplitude > local_median + sigma × local_MAD.
+    4. Return a per-frame set of baseline indices to zero.
+
+    This catches brief RFI bursts that elevate many baselines simultaneously
+    within a single frame (which per-frame MAD filtering cannot catch).
+
+    Parameters
+    ----------
+    frames_by_ts : OrderedDict {timestamp: {pair_name: filepath}}
+    freq_mhz : float
+    n_channels : int
+    sigma : float
+        Number of local MAD deviations above which to flag (default 4.0).
+    window : int
+        Half-width of the running-median window in frames (default 31).
+    verbose : bool
+
+    Returns
+    -------
+    flag_map : dict {timestamp: set of (i, j) baseline indices}
+        Only timestamps that have at least one flagged baseline are included.
+    """
+    from collections import OrderedDict
+
+    timestamps = list(frames_by_ts.keys())
+    n_frames = len(timestamps)
+
+    if n_frames < 2 * window + 1:
+        if verbose:
+            print(f"  [TIME-RFI] Too few frames ({n_frames}) "
+                  f"for time-domain RFI filter (need > {2*window}) → skipped")
+        return {}
+
+    # --- Phase 1: pre-load amplitudes for every baseline × frame ---
+    # amplitudes[baseline_idx, frame_idx] = mean |V| across channels
+    n_baselines = 28
+    amplitudes = np.full((n_baselines, n_frames), np.nan, dtype=np.float64)
+    baseline_map = {}          # (i, j) → index (0..27)
+    bl_idx = 0
+    for i in range(8):
+        for j in range(i + 1, 8):
+            baseline_map[(i, j)] = bl_idx
+            bl_idx += 1
+
+    # Pre-load only cross-correlation visibility amplitudes
+    for fi, ts in enumerate(timestamps):
+        file_map = frames_by_ts[ts]
+        try:
+            _, vis_channels = load_broadband_visibilities(
+                file_map, center_freq_mhz=freq_mhz, n_channels=n_channels
+            )
+            for (i, j), bi in baseline_map.items():
+                amp = np.mean(np.abs(vis_channels[:, i, j]))
+                if amp > 0:
+                    amplitudes[bi, fi] = amp
+        except Exception:
+            continue
+
+    if verbose:
+        n_loaded = np.sum(np.isfinite(amplitudes))
+        print(f"  [TIME-RFI] Loaded {n_loaded} baseline×frame amplitudes "
+              f"({n_baselines} baselines × {n_frames} frames)")
+
+    # --- Phase 2: running-median outlier detection ---
+    half = window // 2
+    flag_map = {}
+
+    for bi in range(n_baselines):
+        # Find valid frames for this baseline
+        valid = np.isfinite(amplitudes[bi])
+        if np.sum(valid) < window:
+            continue
+
+        amp_series = amplitudes[bi]
+
+        for fi in range(n_frames):
+            if not valid[fi] or amp_series[fi] <= 0:
+                continue
+
+            # Build window: up to 'half' neighbours each side (only valid)
+            win_start = max(0, fi - half)
+            win_end = min(n_frames, fi + half + 1)
+            win_vals = amp_series[win_start:win_end]
+            win_valid = win_vals[np.isfinite(win_vals) & (win_vals > 0)]
+
+            if len(win_valid) < max(5, window // 4):
+                continue
+
+            local_median = np.median(win_valid)
+            local_mad = np.median(np.abs(win_valid - local_median))
+            local_std = 1.4826 * local_mad if local_mad > 0 else 1e-6 * local_median
+
+            threshold = local_median + sigma * local_std
+
+            if amp_series[fi] > threshold and amp_series[fi] > local_median * 1.5:
+                ts = timestamps[fi]
+                if ts not in flag_map:
+                    flag_map[ts] = set()
+                # Map baseline index back to (i, j)
+                i, j = list(baseline_map.keys())[bi]
+                flag_map[ts].add((i, j))
+
+    if verbose:
+        n_flagged_frames = len(flag_map)
+        n_flagged_bl = sum(len(v) for v in flag_map.values())
+        print(f"  [TIME-RFI] Flagged {n_flagged_bl} baseline×frame outliers "
+              f"across {n_flagged_frames}/{n_frames} frames "
+              f"(sigma={sigma}, window={window})")
+
+    return flag_map
+
+
+# ==============================================================================
 # Frame 扫描：按日期发现所有 frame
 # ==============================================================================
 def discover_frames_by_date(watch_dir, date_str=None):
@@ -166,44 +319,260 @@ def discover_frames_by_date(watch_dir, date_str=None):
 # ==============================================================================
 # 时角计算
 # ==============================================================================
-def compute_hour_angle(timestamp_str, longitude_deg=116.0):
+# ==============================================================================
+# 观测地点配置
+# ==============================================================================
+def load_observer_location(config_file="observer_location.txt"):
     """
-    从时间戳和观测地经度计算本地时角（以春分点为参考的近似）。
+    从配置文件读取观测地点经纬度。
 
-    简化模型：
-      - 格林尼治恒星时 (GST) ≈ UTC 时间 + 春分点偏移
-      - 本地恒星时 (LST) = GST + longitude / 15
-      - 时角 HA = LST - RA
+    文件格式: latitude,longitude
+    示例: 25.698895459313817,106.88923229782012
 
-    这里假设观测天顶 (declination = 90°)，RA 任意 → HA = LST（相位中心为天顶）。
+    返回: (lat_deg, lon_deg)，若文件不存在则返回 (None, None)
+    """
+    config_path = Path(__file__).parent / config_file
+    if not config_path.exists():
+        return None, None
+
+    try:
+        with open(config_path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                parts = [p.strip() for p in line.split(',')]
+                if len(parts) >= 2:
+                    lat = float(parts[0])
+                    lon = float(parts[1])
+                    return lat, lon
+    except Exception as e:
+        print(f"  [WARNING] Failed to read {config_path}: {e}")
+
+    return None, None
+
+
+def _utc_to_jd(dt):
+    """Convert UTC datetime to Julian Date."""
+    j2000 = datetime(2000, 1, 1, 12, 0, 0)
+    days_since_j2000 = (dt - j2000).total_seconds() / 86400.0
+    return 2451545.0 + days_since_j2000
+
+
+def compute_hour_angle(timestamp_str, longitude_deg=116.0,
+                       utc_offset_hours=0):
+    """
+    根据时间戳和观测经度计算本地时角。
+
+    使用标准 GMST 公式 (IAU 1982 / USNO):
+      GMST = 18.697374558 + 24.06570982441908 × D   (hours, mod 24)
+    其中 D = JD − 2451545.0 (J2000.0 以来的天数)。
+
+    本地恒星时 LST = GMST + longitude / 15。
+    天顶指向：天顶相位中心 = (RA 任意, declination = 观测纬度)
+    天顶时角 = LST（天顶在子午线上时 HA = 0）。
 
     参数:
-        timestamp_str: "YYYYMMDD_HHMMSS" 格式
-        longitude_deg: 观测地经度（东正）
+        timestamp_str: "YYYYMMDD_HHMMSS" 格式（本地时间或 UTC）。
+        longitude_deg: 观测地经度（东正）。
+        utc_offset_hours: 本地时间 → UTC 时差（小时），0=已为 UTC。
 
     返回:
-        hour_angle_deg: 时角（度）
+        hour_angle_deg: 天顶时角（度），= 本地恒星时 × 15
     """
     dt = datetime.strptime(timestamp_str, "%Y%m%d_%H%M%S")
+    # 转换为 UTC
+    if utc_offset_hours != 0:
+        dt = dt - timedelta(hours=utc_offset_hours)
 
-    # 简化的格林尼治恒星时计算
-    # 春分点: 3月20日左右
-    doy = dt.timetuple().tm_yday
-    # 春分日约为第 79 天（3月20日）
-    vernal_equinox_doy = 79
+    jd = _utc_to_jd(dt)
+    D = jd - 2451545.0  # days since J2000.0
 
-    # 格林尼治恒星时 (小时)
-    ut_hours = dt.hour + dt.minute / 60.0 + dt.second / 3600.0
-    # 每天恒星时比太阳时快约 4 分钟 → 每年 24 小时
-    gst_hours = (ut_hours + (doy - vernal_equinox_doy) * 24.0 / 365.25 * 1.0027379) % 24
+    # 格林尼治平恒星时 (USNO 公式, 小时)
+    gmst_hours = (18.697374558 + 24.06570982441908 * D) % 24
 
-    # 本地恒星时
-    lst_hours = (gst_hours + longitude_deg / 15.0) % 24
+    # 本地恒星时 = 天顶时角
+    lst_hours = (gmst_hours + longitude_deg / 15.0) % 24
 
-    # 转换为时角度数 (0h = 0°, 12h = 180°)
-    hour_angle_deg = lst_hours * 15.0
+    return lst_hours * 15.0
 
-    return hour_angle_deg
+
+# ==============================================================================
+# 太阳位置计算（使用 astropy）
+# ==============================================================================
+def _estimate_utc_offset_from_lon(lon_deg):
+    """
+    根据经度估算时区偏移（小时）。
+
+    中国全境统一使用 UTC+8（73°E-135°E 范围内直接返回 8）。
+    其他地区按 lon/15 四舍五入近似。
+
+    Returns
+    -------
+    offset_hours : float
+        UTC = local_time - offset_hours
+    """
+    if 73.0 <= lon_deg <= 135.0:
+        return 8.0  # 中国标准时间 CST (UTC+8)
+    return float(round(lon_deg / 15.0))
+
+
+def compute_sun_altaz(timestamp_str, lat_deg, lon_deg,
+                      utc_offset_hours=0):
+    """
+    计算给定时刻太阳的地平坐标（高度角、方位角）。
+
+    使用 astropy 高精度计算，包括大气折射修正（关闭，保持几何位置）。
+
+    Parameters
+    ----------
+    timestamp_str : str
+        "YYYYMMDD_HHMMSS" 格式的时间戳（本地时间或 UTC，取决于 utc_offset_hours）。
+    lat_deg, lon_deg : float
+        观测地纬度/经度（度，北/东为正）。
+    utc_offset_hours : float
+        本地时间 → UTC 的时差（小时）。例如中国 CST=UTC+8 则传入 8。
+        设为 0 表示时间戳已经是 UTC。
+
+    Returns
+    -------
+    alt_deg : float
+        太阳高度角（度），地平线以上为正。
+    az_deg : float
+        太阳方位角（度），0=北, 90=东, 180=南, 270=西。
+    """
+    from astropy.coordinates import EarthLocation, AltAz, get_sun
+    from astropy.time import Time
+    import astropy.units as u
+
+    dt = datetime.strptime(timestamp_str, "%Y%m%d_%H%M%S")
+    t = Time(dt, scale='utc')
+    if utc_offset_hours != 0:
+        t = t - utc_offset_hours * u.hour
+
+    location = EarthLocation(lat=lat_deg * u.deg, lon=lon_deg * u.deg, height=0 * u.m)
+    altaz_frame = AltAz(obstime=t, location=location,
+                        pressure=0 * u.hPa)  # 无大气折射
+
+    sun = get_sun(t)
+    sun_altaz = sun.transform_to(altaz_frame)
+
+    return float(sun_altaz.alt.deg), float(sun_altaz.az.deg)
+
+
+def compute_sun_trajectory(timestamps, lat_deg, lon_deg,
+                           subsample=60, utc_offset_hours=0,
+                           verbose=True):
+    """
+    计算太阳在观测时段内的轨迹。
+
+    Parameters
+    ----------
+    timestamps : list of str
+        "YYYYMMDD_HHMMSS" 格式的时间戳列表（按时间排序）。
+    lat_deg, lon_deg : float
+        观测地经纬度。
+    subsample : int
+        轨迹点最大数量（对长时间观测做降采样，保持图像清晰）。
+    utc_offset_hours : float
+        本地时间 → UTC 时差（小时），传入 compute_sun_altaz。
+    verbose : bool
+
+    Returns
+    -------
+    trajectory : list of (alt_deg, az_deg, ts_str)
+        太阳地平坐标序列（仅包含地平线以上的点）。
+    """
+    n_ts = len(timestamps)
+    if n_ts == 0:
+        return []
+
+    # 对长时间观测做降采样
+    if n_ts > subsample:
+        indices = np.linspace(0, n_ts - 1, subsample, dtype=int)
+        sampled_ts = [timestamps[i] for i in indices]
+    else:
+        sampled_ts = timestamps
+
+    trajectory = []
+    for ts in sampled_ts:
+        try:
+            alt, az = compute_sun_altaz(ts, lat_deg, lon_deg,
+                                        utc_offset_hours=utc_offset_hours)
+            if alt > -5.0:  # 略低于地平线也保留
+                trajectory.append((alt, az, ts))
+        except Exception as e:
+            if verbose:
+                print(f"  [SUN] Failed for {ts}: {e}")
+            continue
+
+    if verbose:
+        n_above = sum(1 for a, _, _ in trajectory if a >= 0)
+        print(f"  [SUN] Computed {len(trajectory)} Sun positions "
+              f"({n_above} above horizon) from {n_ts} frames")
+
+    return trajectory
+
+
+def _altaz_to_xy_polar(alt_deg, az_deg):
+    """
+    将 (高度角, 方位角) 转换为极坐标全天图的 (x, y) 坐标。
+
+    图像坐标系：
+      - 中心 = 天顶 (alt=90°)
+      - 半径 = 天顶角 / 90°（地平面 r=1.0）
+      - 方位角 0° = 北 (x=0, y>0), 90° = 东 (x>0, y=0)
+
+    Parameters
+    ----------
+    alt_deg : float or array
+        高度角（度），地平线为 0。
+    az_deg : float or array
+        方位角（度），0=北, 90=东。
+
+    Returns
+    -------
+    x, y : float or array
+    """
+    alt = np.atleast_1d(np.asarray(alt_deg, dtype=float))
+    az = np.atleast_1d(np.asarray(az_deg, dtype=float))
+    zenith_deg = 90.0 - alt
+    r = zenith_deg / 90.0
+    az_rad = np.radians(az)
+    x = r * np.sin(az_rad)
+    y = r * np.cos(az_rad)
+    if np.ndim(alt_deg) == 0:
+        return float(x[0]), float(y[0])
+    return x, y
+
+
+def _altaz_to_lm(alt_deg, az_deg):
+    """
+    将 (高度角, 方位角) 转换为 (l, m) 方向余弦坐标。
+
+    天顶指向 (l=0, m=0)：
+      l = sin(天顶角) × sin(方位角)  (东正)
+      m = sin(天顶角) × cos(方位角)  (北正)
+
+    Parameters
+    ----------
+    alt_deg : float or array
+    az_deg : float or array
+
+    Returns
+    -------
+    l, m : float or array
+    """
+    alt = np.atleast_1d(np.asarray(alt_deg, dtype=float))
+    az = np.atleast_1d(np.asarray(az_deg, dtype=float))
+    zenith_rad = np.radians(90.0 - alt)
+    az_rad = np.radians(az)
+    sin_zeta = np.sin(zenith_rad)
+    l = sin_zeta * np.sin(az_rad)
+    m = sin_zeta * np.cos(az_rad)
+    if np.ndim(alt_deg) == 0:
+        return float(l[0]), float(m[0])
+    return l, m
 
 
 # ==============================================================================
@@ -212,7 +581,7 @@ def compute_hour_angle(timestamp_str, longitude_deg=116.0):
 def integrate_snapshot(frames_by_ts, freq_mhz, grid_pts, fov_deg,
                        antennas_file, filter_rfi, apply_w_correction,
                        imaging_mode, n_channels=40, subtract_baseline=False,
-                       verbose=True):
+                       rfi_sigma=2.0, rfi_time_flags=None, verbose=True):
     """
     Snapshot 模式：将所有 frame 的可见度矩阵直接平均，然后生成一张宽带脏图。
 
@@ -227,6 +596,10 @@ def integrate_snapshot(frames_by_ts, freq_mhz, grid_pts, fov_deg,
         print(f"  Method: SNAPSHOT (no celestial motion compensation)")
         if subtract_baseline:
             print(f"  Baseline subtraction: ENABLED")
+        if rfi_time_flags:
+            n_tf = sum(len(v) for v in rfi_time_flags.values())
+            print(f"  Time-domain RFI flags: {n_tf} baselines in "
+                  f"{len(rfi_time_flags)} frames")
         print(f"  Strategy: Average visibilities → broadband imaging")
         print(f"{'='*60}")
 
@@ -243,6 +616,12 @@ def integrate_snapshot(frames_by_ts, freq_mhz, grid_pts, fov_deg,
         )
         if freq_sky_mhz is None:
             freq_sky_mhz = f_sky
+
+        # Apply time-domain RFI flags: zero out flagged baselines
+        if rfi_time_flags and ts in rfi_time_flags:
+            for (i, j) in rfi_time_flags[ts]:
+                vis_channels[:, i, j] = 0.0 + 0.0j
+                vis_channels[:, j, i] = 0.0 + 0.0j
 
         # Check if any channel has data
         has_data = np.any(np.abs(vis_channels) > 0)
@@ -292,14 +671,15 @@ def integrate_snapshot(frames_by_ts, freq_mhz, grid_pts, fov_deg,
             f_mhz = freq_sky_mhz[ci]
 
             if filter_rfi:
-                vis = reject_rfi_visibilities(vis)
+                vis = reject_rfi_visibilities(vis, threshold_sigma=rfi_sigma)
 
             wavelength = 299.792458 / f_mhz
             bu, bv, bw = compute_uvw_from_antennas(
                 antennas, wavelength
             )
-            # 收集 UV 坐标
-            accumulated_uv.append((bu.copy(), bv.copy(), f_mhz))
+            # 收集 UV 坐标 (含共轭)
+            accumulated_uv.append((np.concatenate([bu, -bu]),
+                                   np.concatenate([bv, -bv]), f_mhz))
 
             vis_re, vis_im, auto_corr_sum = _extract_visibility_data(vis)
             ch_dirty = _direct_fourier_sum_cpu(
@@ -333,14 +713,15 @@ def integrate_snapshot(frames_by_ts, freq_mhz, grid_pts, fov_deg,
             f_mhz = freq_sky_mhz[ci]
 
             if filter_rfi:
-                vis = reject_rfi_visibilities(vis)
+                vis = reject_rfi_visibilities(vis, threshold_sigma=rfi_sigma)
 
             wavelength = 299.792458 / f_mhz
             bu, bv, bw = compute_uvw_from_antennas(
                 antennas, wavelength
             )
-            # 收集 UV 坐标
-            accumulated_uv.append((bu.copy(), bv.copy(), f_mhz))
+            # 收集 UV 坐标 (含共轭)
+            accumulated_uv.append((np.concatenate([bu, -bu]),
+                                   np.concatenate([bv, -bv]), f_mhz))
 
             vis_re, vis_im, auto_corr_sum = _extract_visibility_data(vis)
             ch_dirty = _direct_fourier_sum_cpu(
@@ -375,12 +756,81 @@ def integrate_snapshot(frames_by_ts, freq_mhz, grid_pts, fov_deg,
 
 
 # ==============================================================================
+# 多 CPU 并行 worker：处理单个 frame 的计算
+# ==============================================================================
+def _compute_one_frame_worker(args):
+    """
+    在 worker 进程中处理一个 frame 的所有通道成像。
+    返回 (frame_dirty, frame_baseline_or_None, accumulated_uv_list)。
+    """
+    (vis_channels, freq_sky_mhz, hour_angle,
+     antennas, L, M, N, horizon_mask,
+     filter_rfi, rfi_sigma, apply_w_correction,
+     n_channels, subtract_baseline,
+     n_radial, n_azimuthal, imaging_mode,
+     latitude_deg) = args
+
+    frame_dirty = np.zeros_like(L)
+    frame_baseline = np.zeros_like(L) if subtract_baseline else None
+    local_uv = []
+
+    for ci in range(n_channels):
+        vis = vis_channels[ci]
+        f_mhz = freq_sky_mhz[ci]
+
+        if filter_rfi:
+            vis = reject_rfi_visibilities(vis, threshold_sigma=rfi_sigma)
+
+        wavelength = 299.792458 / f_mhz
+        bu, bv, bw = compute_uvw_from_antennas(
+            antennas, wavelength,
+            hour_angle_deg=hour_angle,
+            declination_deg=latitude_deg
+        )
+
+        vis_re, vis_im, auto_corr_sum = _extract_visibility_data(vis)
+
+        # 共轭 UV 覆盖
+        bu_full = np.concatenate([bu, -bu])
+        bv_full = np.concatenate([bv, -bv])
+        bw_full = np.concatenate([bw, -bw])
+        vis_re_full = np.concatenate([vis_re, vis_re])
+        vis_im_full = np.concatenate([vis_im, -vis_im])
+
+        local_uv.append((bu_full.copy(), bv_full.copy(), f_mhz))
+
+        ch_dirty = _direct_fourier_sum_cpu(
+            L, M, N, bu_full, bv_full, bw_full,
+            vis_re_full, vis_im_full, auto_corr_sum,
+            apply_w_correction, horizon_mask
+        )
+        frame_dirty += ch_dirty
+
+        if subtract_baseline:
+            bl = _cached_baseline(
+                L, M, N, horizon_mask,
+                bu, bv, bw, apply_w_correction,
+                n_radial=n_radial if imaging_mode in ("polar_cpu", "gpu") else None,
+                n_azimuthal=n_azimuthal if imaging_mode in ("polar_cpu", "gpu") else None
+            )
+            frame_baseline += bl
+
+    frame_dirty /= n_channels
+    if subtract_baseline:
+        frame_baseline /= n_channels
+
+    return frame_dirty, frame_baseline, local_uv
+
+
+# ==============================================================================
 # 方法 2: Tracked 积分（考虑天体位移）
 # ==============================================================================
 def integrate_tracked(frames_by_ts, freq_mhz, grid_pts, fov_deg,
                       antennas_file, filter_rfi, apply_w_correction,
-                      imaging_mode, longitude_deg=116.0, n_channels=40,
-                      subtract_baseline=False, verbose=True):
+                      imaging_mode, longitude_deg=116.0, latitude_deg=40.0,
+                      n_channels=40, subtract_baseline=False,
+                      rfi_sigma=2.0, rfi_time_flags=None, verbose=True,
+                      utc_offset_hours=0, use_gpu=False, n_workers=1):
     """
     Tracked 模式：每个 frame 用其时角对应的 (u,v,w) 独立成像，然后叠加脏图。
     同时每个 frame 使用多频率通道实现宽带 uv 覆盖积分。
@@ -389,20 +839,46 @@ def integrate_tracked(frames_by_ts, freq_mhz, grid_pts, fov_deg,
     平面旋转。每个 frame × 每个频率通道对应不同的 uv 采样，叠加后获得
     更好的 uv 覆盖。
 
+    相位中心指向本地天顶:
+      declination = 观测纬度 (latitude_deg)
+      hour_angle  = 本地恒星时 (LST, 从 longitude_deg 计算)
+
     数学：
       I_D(l,m) = 1/(N×C) Σ_k Σ_c FT^{-1}[V_k(f_c, u_{k,c}, v_{k,c}, w_{k,c})]
     其中 (u_{k,c}, v_{k,c}, w_{k,c}) 由第 k 个 frame 的时角和第 c 个频率决定。
+
+    加速选项:
+      use_gpu=True  → GPU (CuPy) 加速 Fourier 求和（~10-30x）
+      n_workers>1   → 多进程并行处理 frames（~N× speedup）
 
     优点：补偿地球自转 + 宽带频率积分，uv 覆盖最完整
     缺点：计算量 N_frames × N_channels × 28 baselines
     """
     if verbose:
+        mode_desc = "TRACKED (celestial motion compensated)"
+        accel_parts = []
+        if use_gpu and _GPU_AVAILABLE:
+            accel_parts.append("GPU (CuPy)")
+        if n_workers > 1:
+            accel_parts.append(f"CPU×{n_workers} workers")
+        accel_str = " + ".join(accel_parts) if accel_parts else "serial CPU"
         print(f"\n{'='*60}")
-        print(f"  Method: TRACKED (with celestial motion compensation)")
+        print(f"  Method: {mode_desc}")
+        print(f"  Acceleration: {accel_str}")
+        print(f"  Phase center: zenith (dec={latitude_deg:.2f}°, HA=LST)")
         if subtract_baseline:
             print(f"  Baseline subtraction: ENABLED")
+        if rfi_time_flags:
+            n_tf = sum(len(v) for v in rfi_time_flags.values())
+            print(f"  Time-domain RFI flags: {n_tf} baselines in "
+                  f"{len(rfi_time_flags)} frames")
         print(f"  Strategy: Per-frame × per-channel imaging → stack")
         print(f"{'='*60}")
+
+    # ── 验证 GPU 可用性 ──
+    if use_gpu and not _GPU_AVAILABLE:
+        print("  [WARN] GPU requested but CuPy not available, falling back to CPU")
+        use_gpu = False
 
     antennas = load_optimized_antennas(antennas_file)
     timestamps = list(frames_by_ts.keys())
@@ -412,107 +888,267 @@ def integrate_tracked(frames_by_ts, freq_mhz, grid_pts, fov_deg,
         n_radial = max(grid_pts // 2, 64)
         n_azimuthal = max(grid_pts, 128)
         integrated = np.zeros((n_radial, n_azimuthal), dtype=np.float64)
+
+        # 预计算天空网格（对所有帧、所有通道恒定）
+        L, M, N, horizon_mask, _, _ = build_polar_sky_grid_GPU(
+            n_radial=n_radial, n_azimuthal=n_azimuthal
+        )
+        if fov_deg < 180.0:
+            fov_rad = np.radians(fov_deg / 2.0)
+            zeta_grid = np.radians(np.linspace(0.0, 90.0, n_radial))
+            zeta_2d = zeta_grid[:, np.newaxis]
+            fov_mask = zeta_2d <= fov_rad
+            horizon_mask = horizon_mask & fov_mask
     else:
+        n_radial = n_azimuthal = None
         integrated = np.zeros((grid_pts, grid_pts), dtype=np.float64)
+
+        # 预计算天空网格（对所有帧、所有通道恒定）
+        L, M, N, horizon_mask, _, _ = build_lm_grid(
+            grid_pts=grid_pts, fov_deg=fov_deg
+        )
+
+    # ── GPU 初始化：上传天空网格到 GPU（一次） ──
+    L_g = M_g = N_g = hm_g = None
+    integrated_g = None
+    if use_gpu:
+        L_g = _cp.asarray(L, dtype=_cp.float64)
+        M_g = _cp.asarray(M, dtype=_cp.float64)
+        N_g = _cp.asarray(N, dtype=_cp.float64)
+        hm_g = _cp.asarray(horizon_mask)
+        integrated_g = _cp.zeros(integrated.shape, dtype=_cp.float64)
+        if verbose:
+            mem_mb = (L.nbytes + M.nbytes + N.nbytes) / 1024**2
+            print(f"  GPU sky grid uploaded ({mem_mb:.1f} MB), accumulating on GPU")
 
     baseline_integrated = np.zeros_like(integrated) if subtract_baseline else None
     valid_frames = 0
     total_frames = len(timestamps)
     freq_sky_mhz = None
-    accumulated_uv = []  # 收集所有 frame×channel 的 (u,v) 坐标
+    accumulated_uv = []
 
-    for idx, ts in enumerate(timestamps):
-        file_map = frames_by_ts[ts]
-        f_sky, vis_channels = load_broadband_visibilities(
-            file_map, center_freq_mhz=freq_mhz, n_channels=n_channels
-        )
-        if freq_sky_mhz is None:
-            freq_sky_mhz = f_sky
-
-        has_data = np.any(np.abs(vis_channels) > 0)
-        if not has_data:
-            if verbose:
-                print(f"  [{idx+1}/{total_frames}] {ts}: SKIP (no data)")
-            continue
-
-        # 计算此时刻的时角
-        hour_angle = compute_hour_angle(ts, longitude_deg)
-
-        t0 = time.time()
-        frame_dirty = np.zeros_like(integrated)
-        frame_baseline = np.zeros_like(integrated) if subtract_baseline else None
-
-        for ci in range(n_channels):
-            vis = vis_channels[ci]
-            f_mhz = freq_sky_mhz[ci]
-
-            if filter_rfi:
-                vis = reject_rfi_visibilities(vis)
-
-            # 计算时变 + 频率相关的 (u, v, w)
-            wavelength = 299.792458 / f_mhz
-            bu, bv, bw = compute_uvw_from_antennas(
-                antennas, wavelength,
-                hour_angle_deg=hour_angle,
-                declination_deg=90.0
-            )
-            # 收集 UV 坐标 (每个 frame、每个 channel)
-            accumulated_uv.append((bu.copy(), bv.copy(), f_mhz))
-
-            vis_re, vis_im, auto_corr_sum = _extract_visibility_data(vis)
-
-            if imaging_mode in ("polar_cpu", "gpu"):
-                L, M, N, horizon_mask, _, _ = build_polar_sky_grid_GPU(
-                    n_radial=n_radial, n_azimuthal=n_azimuthal
-                )
-                if fov_deg < 180.0:
-                    fov_rad = np.radians(fov_deg / 2.0)
-                    zeta_grid = np.radians(np.linspace(0.0, 90.0, n_radial))
-                    zeta_2d = zeta_grid[:, np.newaxis]
-                    fov_mask = zeta_2d <= fov_rad
-                    horizon_mask = horizon_mask & fov_mask
-
-                ch_dirty = _direct_fourier_sum_cpu(
-                    L, M, N, bu, bv, bw,
-                    vis_re, vis_im, auto_corr_sum,
-                    apply_w_correction, horizon_mask
-                )
-            else:
-                L, M, N, horizon_mask, _, _ = build_lm_grid(
-                    grid_pts=grid_pts, fov_deg=fov_deg
-                )
-                ch_dirty = _direct_fourier_sum_cpu(
-                    L, M, N, bu, bv, bw,
-                    vis_re, vis_im, auto_corr_sum,
-                    apply_w_correction, horizon_mask
-                )
-
-            frame_dirty += ch_dirty
-
-            if subtract_baseline:
-                bl = _cached_baseline(
-                    L, M, N, horizon_mask,
-                    bu, bv, bw, apply_w_correction,
-                    n_radial=n_radial if imaging_mode in ("polar_cpu", "gpu") else None,
-                    n_azimuthal=n_azimuthal if imaging_mode in ("polar_cpu", "gpu") else None
-                )
-                frame_baseline += bl
-
-        frame_dirty /= n_channels
-        if subtract_baseline:
-            frame_baseline /= n_channels
-
-        elapsed = time.time() - t0
-
-        integrated += frame_dirty
-        if subtract_baseline:
-            baseline_integrated += frame_baseline
-        valid_frames += 1
-
+    # ═══════════════════════════════════════════════════════════════
+    # 多 CPU 并行分支
+    # ═══════════════════════════════════════════════════════════════
+    if n_workers > 1 and total_frames > 1:
+        # ── 预加载所有帧数据到内存 ──
         if verbose:
-            ha_str = f"HA={hour_angle:.1f}°"
-            print(f"  [{idx+1}/{total_frames}] {ts}  {ha_str}  "
-                  f"imaging={elapsed:.2f}s")
+            print(f"  Pre-loading {total_frames} frames for parallel processing...")
+        t_preload = time.time()
+        frame_jobs = []
+        for idx, ts in enumerate(timestamps):
+            file_map = frames_by_ts[ts]
+            f_sky, vis_channels = load_broadband_visibilities(
+                file_map, center_freq_mhz=freq_mhz, n_channels=n_channels
+            )
+            if freq_sky_mhz is None:
+                freq_sky_mhz = f_sky
+
+            if rfi_time_flags and ts in rfi_time_flags:
+                for (i, j) in rfi_time_flags[ts]:
+                    vis_channels[:, i, j] = 0.0 + 0.0j
+                    vis_channels[:, j, i] = 0.0 + 0.0j
+
+            if not np.any(np.abs(vis_channels) > 0):
+                continue
+
+            hour_angle = compute_hour_angle(ts, longitude_deg,
+                                            utc_offset_hours=utc_offset_hours)
+            frame_jobs.append((
+                vis_channels, freq_sky_mhz, hour_angle,
+                antennas, L, M, N, horizon_mask,
+                filter_rfi, rfi_sigma, apply_w_correction,
+                n_channels, subtract_baseline,
+                n_radial, n_azimuthal, imaging_mode,
+                latitude_deg
+            ))
+        if verbose:
+            print(f"  Pre-load done ({time.time() - t_preload:.1f}s), "
+                  f"{len(frame_jobs)} valid frames")
+
+        # ── 并行处理 ──
+        t_parallel = time.time()
+        actual_workers = min(n_workers, len(frame_jobs))
+        total_jobs = len(frame_jobs)
+        if verbose:
+            print(f"  Parallel processing: {total_jobs} frames "
+                  f"× {actual_workers} workers, starting...")
+        with ProcessPoolExecutor(max_workers=actual_workers) as executor:
+            future_to_idx = {}
+            for i, job in enumerate(frame_jobs):
+                future = executor.submit(_compute_one_frame_worker, job)
+                future_to_idx[future] = i
+
+            completed = 0
+            for future in as_completed(future_to_idx):
+                fd, fb, local_uv = future.result()
+                integrated += fd
+                if subtract_baseline and fb is not None:
+                    baseline_integrated += fb
+                accumulated_uv.extend(local_uv)
+                valid_frames += 1
+                completed += 1
+
+                if verbose:
+                    elapsed_so_far = time.time() - t_parallel
+                    avg_per_frame = elapsed_so_far / completed
+                    remaining = (total_jobs - completed) * avg_per_frame
+                    eta_min = remaining / 60.0
+                    pct = 100.0 * completed / total_jobs
+                    print(f"\r  [{completed}/{total_jobs}] {pct:.0f}% | "
+                          f"avg {avg_per_frame:.2f}s/frame | "
+                          f"ETA {eta_min:.1f}min",
+                          end="", flush=True)
+
+        elapsed_total = time.time() - t_parallel
+        if verbose:
+            print()  # newline after progress
+            print(f"  Done: {total_jobs} frames in {elapsed_total:.1f}s "
+                  f"({elapsed_total/total_jobs:.2f}s/frame, "
+                  f"{actual_workers} workers)")
+
+    # ═══════════════════════════════════════════════════════════════
+    # 串行分支（可选 GPU 加速）
+    # ═══════════════════════════════════════════════════════════════
+    else:
+        t_serial_start = time.time()
+        for idx, ts in enumerate(timestamps):
+            file_map = frames_by_ts[ts]
+            f_sky, vis_channels = load_broadband_visibilities(
+                file_map, center_freq_mhz=freq_mhz, n_channels=n_channels
+            )
+            if freq_sky_mhz is None:
+                freq_sky_mhz = f_sky
+
+            if rfi_time_flags and ts in rfi_time_flags:
+                for (i, j) in rfi_time_flags[ts]:
+                    vis_channels[:, i, j] = 0.0 + 0.0j
+                    vis_channels[:, j, i] = 0.0 + 0.0j
+
+            has_data = np.any(np.abs(vis_channels) > 0)
+            if not has_data:
+                if verbose:
+                    print(f"  [{idx+1}/{total_frames}] {ts}: SKIP (no data)")
+                continue
+
+            hour_angle = compute_hour_angle(ts, longitude_deg,
+                                            utc_offset_hours=utc_offset_hours)
+
+            t0 = time.time()
+
+            if use_gpu and L_g is not None:
+                # ── GPU 路径：在 GPU 上累积所有通道，最后一次性下载 ──
+                frame_dirty_g = _cp.zeros_like(L_g)
+                frame_baseline_g = _cp.zeros_like(L_g) if subtract_baseline else None
+                frame_baseline = np.zeros_like(integrated) if subtract_baseline else None
+                for ci in range(n_channels):
+                    vis = vis_channels[ci]
+                    f_mhz = freq_sky_mhz[ci]
+                    if filter_rfi:
+                        vis = reject_rfi_visibilities(vis, threshold_sigma=rfi_sigma)
+
+                    wavelength = 299.792458 / f_mhz
+                    bu, bv, bw = compute_uvw_from_antennas(
+                        antennas, wavelength,
+                        hour_angle_deg=hour_angle,
+                        declination_deg=latitude_deg
+                    )
+                    vis_re, vis_im, auto_corr_sum = _extract_visibility_data(vis)
+
+                    bu_full = np.concatenate([bu, -bu])
+                    bv_full = np.concatenate([bv, -bv])
+                    bw_full = np.concatenate([bw, -bw])
+                    vis_re_full = np.concatenate([vis_re, vis_re])
+                    vis_im_full = np.concatenate([vis_im, -vis_im])
+
+                    accumulated_uv.append((bu_full.copy(), bv_full.copy(), f_mhz))
+
+                    ch_dirty_g = _fourier_sum_gpu_tracked(
+                        L_g, M_g, N_g, hm_g,
+                        bu_full, bv_full, bw_full,
+                        vis_re_full, vis_im_full, auto_corr_sum,
+                        apply_w_correction
+                    )
+                    frame_dirty_g += ch_dirty_g
+
+                    if subtract_baseline:
+                        bl_g = _compute_baseline_gpu(
+                            L_g, M_g, N_g, hm_g,
+                            bu, bv, bw, apply_w_correction
+                        )
+                        frame_baseline_g += bl_g
+
+                frame_dirty = _cp.asnumpy(frame_dirty_g)
+                if subtract_baseline:
+                    frame_baseline = _cp.asnumpy(frame_baseline_g)
+            else:
+                # ── CPU 路径 ──
+                frame_dirty = np.zeros_like(integrated)
+                frame_baseline = np.zeros_like(integrated) if subtract_baseline else None
+
+                for ci in range(n_channels):
+                    vis = vis_channels[ci]
+                    f_mhz = freq_sky_mhz[ci]
+
+                    if filter_rfi:
+                        vis = reject_rfi_visibilities(vis, threshold_sigma=rfi_sigma)
+
+                    wavelength = 299.792458 / f_mhz
+                    bu, bv, bw = compute_uvw_from_antennas(
+                        antennas, wavelength,
+                        hour_angle_deg=hour_angle,
+                        declination_deg=latitude_deg
+                    )
+
+                    vis_re, vis_im, auto_corr_sum = _extract_visibility_data(vis)
+
+                    # ── 共轭 UV 覆盖 ──
+                    bu_full = np.concatenate([bu, -bu])
+                    bv_full = np.concatenate([bv, -bv])
+                    bw_full = np.concatenate([bw, -bw])
+                    vis_re_full = np.concatenate([vis_re, vis_re])
+                    vis_im_full = np.concatenate([vis_im, -vis_im])
+
+                    accumulated_uv.append((bu_full.copy(), bv_full.copy(), f_mhz))
+
+                    ch_dirty = _direct_fourier_sum_cpu(
+                        L, M, N, bu_full, bv_full, bw_full,
+                        vis_re_full, vis_im_full, auto_corr_sum,
+                        apply_w_correction, horizon_mask
+                    )
+                    frame_dirty += ch_dirty
+
+                if subtract_baseline:
+                    bl = _cached_baseline(
+                        L, M, N, horizon_mask,
+                        bu, bv, bw, apply_w_correction,
+                        n_radial=n_radial if imaging_mode in ("polar_cpu", "gpu") else None,
+                        n_azimuthal=n_azimuthal if imaging_mode in ("polar_cpu", "gpu") else None
+                    )
+                    frame_baseline += bl
+
+            frame_dirty /= n_channels
+            if subtract_baseline:
+                frame_baseline /= n_channels
+
+            elapsed = time.time() - t0
+
+            integrated += frame_dirty
+            if subtract_baseline:
+                baseline_integrated += frame_baseline
+            valid_frames += 1
+
+            if verbose:
+                ha_str = f"HA={hour_angle:.1f}°"
+                tag = "[GPU]" if use_gpu else ""
+                elapsed_so_far = time.time() - t_serial_start
+                processed = idx + 1
+                avg_per = elapsed_so_far / processed
+                remaining = (total_frames - processed) * avg_per
+                eta_min = remaining / 60.0
+                print(f"  [{processed}/{total_frames}] {ts}  {ha_str}  "
+                      f"{tag} frame={elapsed:.2f}s | "
+                      f"ETA {eta_min:.1f}min")
 
     if valid_frames == 0:
         print("  [ERROR] No valid frames to integrate!")
@@ -549,7 +1185,9 @@ def save_integrated_image(dirty_img, date_str, method, imaging_mode,
                           antennas=None, antennas_file=None,
                           n_channels=40, freq_sky_mhz=None,
                           scale="linear", accumulated_uv=None,
-                          subtract_baseline=False, verbose=True):
+                          subtract_baseline=False, observer_lat=None,
+                          sun_trajectory=None, observer_lon=None,
+                          verbose=True):
     """
     保存积分脏图为 PNG 和 NPY，附带 UV 覆盖图。
 
@@ -573,22 +1211,19 @@ def save_integrated_image(dirty_img, date_str, method, imaging_mode,
     has_uv = antennas is not None or accumulated_uv is not None
 
     import matplotlib.gridspec as gridspec
-    fig = plt.figure(figsize=(16, 10) if has_uv else (14, 9),
-                     facecolor='#1a1a2e',
-                     layout='constrained' if has_uv else None)
-
+    # 放弃 layout='constrained'（与 GridSpec 冲突会导致渲染卡死），改用 tight_layout
     if has_uv:
+        fig = plt.figure(figsize=(16, 8), facecolor='#1a1a2e')
+        # 左右并排：左列 (dirty image) 正方，右列上下堆叠 UV + 天线
         gs = gridspec.GridSpec(2, 2, figure=fig,
-                               height_ratios=[1.6, 1],
-                               hspace=0.35, wspace=0.35)
-        ax_main = fig.add_subplot(gs[0, :], facecolor='black')
-        ax_uv = fig.add_subplot(gs[1, 0], facecolor='#0d1b2a')
+                               width_ratios=[1, 1.2],
+                               height_ratios=[1.2, 1],
+                               hspace=0.35, wspace=0.3)
+        ax = fig.add_subplot(gs[:, 0], facecolor='black')
+        ax_uv = fig.add_subplot(gs[0, 1], facecolor='#0d1b2a')
         ax_ant = fig.add_subplot(gs[1, 1], facecolor='#16213e')
-
-    # 选择主绘图轴
-    if has_uv:
-        ax = ax_main
     else:
+        fig = plt.figure(figsize=(10, 8), facecolor='#1a1a2e')
         ax = fig.add_subplot(111, facecolor='black')
 
     if imaging_mode in ("polar_cpu", "gpu"):
@@ -608,8 +1243,6 @@ def save_integrated_image(dirty_img, date_str, method, imaging_mode,
         X_edges = ZETA_E * np.sin(AZ_E)
         Y_edges = ZETA_E * np.cos(AZ_E)
 
-        if not has_uv:
-            ax = fig.add_subplot(111, facecolor='black')
         ax.set_aspect('equal')
 
         # 参考网格
@@ -650,6 +1283,10 @@ def save_integrated_image(dirty_img, date_str, method, imaging_mode,
                            cmap='inferno', shading='flat',
                            norm=norm, rasterized=True)
 
+        # ── 绘制太阳位置/轨迹 ──
+        if sun_trajectory:
+            _draw_sun_on_polar(ax, sun_trajectory)
+
         cbar_label = 'Intensity (log₁₀)' if scale == 'log' else 'Intensity'
         cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label=cbar_label)
         cbar.ax.yaxis.label.set_color('white')
@@ -666,8 +1303,6 @@ def save_integrated_image(dirty_img, date_str, method, imaging_mode,
     else:
         # ── Cartesian l/m 图 ──
         l_max = np.sin(np.radians(fov_deg / 2))
-        if not has_uv:
-            ax = fig.add_subplot(111, facecolor='black')
         ax.set_aspect('equal')
 
         # 绘图 — 使用 compute_display_norm 支持 linear/log scale
@@ -676,6 +1311,10 @@ def save_integrated_image(dirty_img, date_str, method, imaging_mode,
         im = ax.imshow(display_data, extent=[-l_max, l_max, -l_max, l_max],
                        origin='upper', cmap='inferno', aspect='equal',
                        interpolation='bilinear', norm=norm)
+
+        # ── 绘制太阳位置/轨迹 ──
+        if sun_trajectory:
+            _draw_sun_on_cartesian(ax, sun_trajectory, fov_deg)
 
         cbar_label = 'Intensity (log₁₀)' if scale == 'log' else 'Intensity'
         cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label=cbar_label)
@@ -695,33 +1334,172 @@ def save_integrated_image(dirty_img, date_str, method, imaging_mode,
         ax.set_title(title, color='white', fontsize=13)
 
     # ── UV 覆盖 + 天线布局子图 ──
+    dec_for_uv = observer_lat if observer_lat is not None else 90.0
     if has_uv:
         _draw_uv_coverage_subplot(ax_uv, antennas, freq_mhz,
                                   data_dir=output_dir.parent / "correlation_results",
                                   accumulated_uv=accumulated_uv,
-                                  method=method)
+                                  method=method, uv_bins=grid_pts,
+                                  declination_deg=dec_for_uv)
         _draw_antenna_layout_subplot(ax_ant, antennas)
-    else:
-        fig.tight_layout(pad=2.0)
+
+    fig.tight_layout(pad=2.0)
 
     # 保存
     png_path = output_dir / f"integrated_{date_str}_{method}.png"
     npy_path = output_dir / f"integrated_{date_str}_{method}.npy"
 
-    fig.savefig(png_path, dpi=150, facecolor=fig.get_facecolor())
-    np.save(npy_path, dirty_img)
-    plt.close(fig)
-
-    if verbose:
-        print(f"\n  Saved PNG: {png_path}")
-        print(f"  Saved NPY: {npy_path}")
+    try:
+        fig.savefig(png_path, dpi=150, facecolor=fig.get_facecolor())
+        np.save(npy_path, dirty_img)
+        plt.close(fig)
+        if verbose:
+            print(f"\n  Saved PNG: {png_path}")
+            print(f"  Saved NPY: {npy_path}")
+    except Exception as e:
+        print(f"\n  [WARN] Plotting/saving error: {e}")
+        plt.close(fig)
+        np.save(npy_path, dirty_img)
+        if verbose:
+            print(f"  [WARN] PNG save failed, but NPY saved: {npy_path}")
 
     return png_path, npy_path
 
 
+# ==============================================================================
+# 太阳位置绘制辅助函数
+# ==============================================================================
+def _draw_sun_on_polar(ax, trajectory):
+    """
+    在极坐标全天图上绘制太阳轨迹。
+
+    trajectory : list of (alt_deg, az_deg, ts_str)
+    """
+    if not trajectory:
+        return
+
+    alts = np.array([t[0] for t in trajectory])
+    azs = np.array([t[1] for t in trajectory])
+    # 只显示地平线以上的点
+    above = alts >= 0.0
+
+    xs, ys = _altaz_to_xy_polar(alts, azs)
+
+    # 标记点（地平线以上）
+    above_x = xs[above]
+    above_y = ys[above]
+    if len(above_x) > 1:
+        # 中间点缀小点
+        ax.scatter(above_x[1:-1], above_y[1:-1], s=15, c='#FFD700',
+                   alpha=0.6, edgecolors='none', zorder=11)
+    # 起始点（大圆）
+    if len(above_x) > 0:
+        ax.scatter([above_x[0]], [above_y[0]], s=80, c='#FFA500',
+                   marker='o', edgecolors='white', linewidths=1.2,
+                   zorder=12, label='Sun (start)')
+    # 终点（大太阳符号）
+    if len(above_x) > 1:
+        ax.scatter([above_x[-1]], [above_y[-1]], s=200, c='#FFD700',
+                   marker='*', edgecolors='#FF6600', linewidths=1.5,
+                   zorder=12, label='Sun (end)')
+    # 轨迹线（仅地平线以上部分，加粗）
+    if np.sum(above) >= 2:
+        segments = []
+        seg_x, seg_y = [], []
+        for i in range(len(trajectory)):
+            if above[i]:
+                seg_x.append(xs[i])
+                seg_y.append(ys[i])
+            else:
+                if len(seg_x) >= 2:
+                    segments.append((np.array(seg_x), np.array(seg_y)))
+                seg_x, seg_y = [], []
+        if len(seg_x) >= 2:
+            segments.append((np.array(seg_x), np.array(seg_y)))
+
+        for sx, sy in segments:
+            ax.plot(sx, sy, color='#FFD700', linewidth=2.0, alpha=0.9,
+                    linestyle='-', zorder=10)
+
+    # 图例
+    ax.legend(loc='lower left', fontsize=7,
+              facecolor='#1a1a2e', edgecolor='#336699',
+              labelcolor='white', markerscale=0.8)
+
+
+def _draw_sun_on_cartesian(ax, trajectory, fov_deg):
+    """
+    在 Cartesian l/m 图上绘制太阳轨迹。
+
+    trajectory : list of (alt_deg, az_deg, ts_str)
+    fov_deg : 视场角，用于判断太阳是否在视场内
+    """
+    if not trajectory:
+        return
+
+    alts = np.array([t[0] for t in trajectory])
+    azs = np.array([t[1] for t in trajectory])
+    ls, ms = _altaz_to_lm(alts, azs)
+
+    l_max = np.sin(np.radians(fov_deg / 2.0))
+    in_fov = (np.abs(ls) <= l_max) & (np.abs(ms) <= l_max) & (ls**2 + ms**2 <= 1.0)
+
+    if np.sum(in_fov) < 1:
+        return  # 太阳不在视场内，不绘制
+
+    # 标记点
+    in_l = ls[in_fov]
+    in_m = ms[in_fov]
+    if len(in_l) > 1:
+        ax.scatter(in_l[1:-1], in_m[1:-1], s=15, c='#FFD700',
+                   alpha=0.6, edgecolors='none', zorder=11)
+    if len(in_l) > 0:
+        ax.scatter([in_l[0]], [in_m[0]], s=80, c='#FFA500',
+                   marker='o', edgecolors='white', linewidths=1.2,
+                   zorder=12, label='Sun (start)')
+    if len(in_l) > 1:
+        ax.scatter([in_l[-1]], [in_m[-1]], s=200, c='#FFD700',
+                   marker='*', edgecolors='#FF6600', linewidths=1.5,
+                   zorder=12, label='Sun (end)')
+    # 轨迹线
+    if np.sum(in_fov) >= 2:
+        segments = []
+        seg_l, seg_m = [], []
+        for i in range(len(trajectory)):
+            if in_fov[i]:
+                seg_l.append(ls[i])
+                seg_m.append(ms[i])
+            else:
+                if len(seg_l) >= 2:
+                    segments.append((np.array(seg_l), np.array(seg_m)))
+                seg_l, seg_m = [], []
+        if len(seg_l) >= 2:
+            segments.append((np.array(seg_l), np.array(seg_m)))
+
+        for sl, sm in segments:
+            ax.plot(sl, sm, color='#FFD700', linewidth=2.0, alpha=0.9,
+                    linestyle='-', zorder=10)
+
+    ax.legend(loc='lower left', fontsize=7,
+              facecolor='#1a1a2e', edgecolor='#336699',
+              labelcolor='white', markerscale=0.8)
+
+
+# ==============================================================================
+# UV 覆盖子图绘制
+# ==============================================================================
+
+
 def _draw_uv_coverage_subplot(ax_uv, antennas, freq_mhz, data_dir=None,
-                               accumulated_uv=None, method="snapshot"):
-    """在指定轴上绘制 UV 覆盖图（理论轨迹 + 积分 UV 采样点）"""
+                               accumulated_uv=None, method="snapshot",
+                               uv_bins=200, declination_deg=90.0):
+    """在指定轴上绘制 UV 覆盖图（理论轨迹 + 网格 binning 密度图）。
+
+    UV 采样点按与成图分辨率匹配的规则网格做 2D 直方图 binning，
+    每个格点的值 = 落入该格点的 UV 采样数，以 log 密度显示。
+
+    declination_deg: 相位中心赤纬，影响理论 UV 轨迹（天顶指向 = 观测纬度）。
+    """
     # 读取实际频率范围
     flo, fhi = None, None
     if data_dir is not None:
@@ -732,10 +1510,46 @@ def _draw_uv_coverage_subplot(ax_uv, antennas, freq_mhz, data_dir=None,
         flo = freq_mhz - 50.0
         fhi = freq_mhz + 50.0
 
-    uv_lines, freq_samples, uv_center = compute_uv_tracks(
-        antennas, freq_low_mhz=flo, freq_high_mhz=fhi,
-        n_samples=20
-    )
+    # ── 计算 UV 数据范围（先收集所有采样点）──
+    uv_data_lim = 0.0
+    all_u_raw, all_v_raw = np.array([]), np.array([])
+    total_uv_samples = 0
+    actual_ch_freqs = None  # 实际信道频率，用于对齐理论轨迹
+
+    if accumulated_uv is not None and len(accumulated_uv) > 0:
+        u_list = []
+        v_list = []
+        all_freqs = set()
+        for bu, bv, f_mhz in accumulated_uv:
+            u_list.extend(bu)
+            v_list.extend(bv)
+            # 收集信道频率（每条目录中 f_mhz 是单个 float）
+            all_freqs.add(f_mhz)
+        all_u_raw = np.array(u_list)
+        all_v_raw = np.array(v_list)
+        total_uv_samples = len(accumulated_uv)
+        actual_ch_freqs = np.sort(np.array(list(all_freqs))) if all_freqs else None
+
+    # ── 计算 UV 轨迹：优先用实际信道频率，确保与密度图对齐 ──
+    if actual_ch_freqs is not None:
+        n_ant = antennas.shape[0]
+        n_bl = n_ant * (n_ant - 1) // 2
+        n_ch = len(actual_ch_freqs)
+        uv_lines = np.zeros((n_bl, n_ch, 2))
+        for k, f in enumerate(actual_ch_freqs):
+            wavelength = 299.792458 / f
+            bu, bv, _ = compute_uvw_from_antennas(
+                antennas, wavelength,
+                hour_angle_deg=0.0, declination_deg=declination_deg
+            )
+            uv_lines[:, k, 0] = bu
+            uv_lines[:, k, 1] = bv
+        freq_samples = actual_ch_freqs
+    else:
+        uv_lines, freq_samples, uv_center = compute_uv_tracks(
+            antennas, freq_low_mhz=flo, freq_high_mhz=fhi,
+            n_samples=20
+        )
 
     ax_uv.set_xlabel("u (λ)", color='white')
     ax_uv.set_ylabel("v (λ)", color='white')
@@ -746,38 +1560,35 @@ def _draw_uv_coverage_subplot(ax_uv, antennas, freq_mhz, data_dir=None,
     n_baselines = uv_lines.shape[0]
     cmap = plt.cm.plasma
 
-    # ── 绘制积分 UV 采样点 (散点，半透明) ──
-    if accumulated_uv is not None and len(accumulated_uv) > 0:
-        all_u = []
-        all_v = []
-        for bu, bv, _f_mhz in accumulated_uv:
-            all_u.extend(bu)
-            all_v.extend(bv)
-            # 共轭对称点
-            all_u.extend(-bu)
-            all_v.extend(-bv)
-        all_u = np.array(all_u)
-        all_v = np.array(all_v)
+    if len(all_u_raw) > 0:
+        uv_data_lim = max(np.max(np.abs(all_u_raw)),
+                          np.max(np.abs(all_v_raw))) * 1.08
 
-        # 采样密度着色
-        from scipy.stats import gaussian_kde
-        try:
-            xy = np.vstack([all_u, all_v])
-            z = gaussian_kde(xy)(xy)
-            idx = z.argsort()
-            all_u_s = all_u[idx]
-            all_v_s = all_v[idx]
-            z_s = z[idx]
-        except Exception:
-            all_u_s = all_u
-            all_v_s = all_v
-            z_s = np.ones_like(all_u)
+    n_total = len(all_u_raw)
 
-        sc = ax_uv.scatter(all_u_s, all_v_s, c=z_s,
-                           s=2, cmap='plasma', alpha=0.5,
-                           edgecolors='none', zorder=10, rasterized=True)
+    # ── 绘制积分 UV 覆盖密度图（网格 binning）──
+    if total_uv_samples > 0 and uv_data_lim > 0:
+        # 自适应 bin 数：避免数据稀疏时格点过密导致画面空洞，
+        # 同时不超过传入的上限 uv_bins（通常即 grid_pts）
+        optimal_bins = int(np.sqrt(n_total / 2)) if n_total > 0 else 64
+        uv_bins = min(uv_bins, max(64, optimal_bins))
 
-    # ── 理论 UV 轨迹 (背景) ──
+        u_edges = np.linspace(-uv_data_lim, uv_data_lim, uv_bins + 1)
+        v_edges = np.linspace(-uv_data_lim, uv_data_lim, uv_bins + 1)
+
+        # 2D 直方图：每个格点值 = 落入该格点的 UV 采样数
+        H, _, _ = np.histogram2d(all_u_raw, all_v_raw,
+                                 bins=[u_edges, v_edges])
+
+        # log 密度（+1 避免 log(0)）
+        H_display = np.log10(H + 1)
+
+        U_mesh, V_mesh = np.meshgrid(u_edges, v_edges, indexing='ij')
+        ax_uv.pcolormesh(U_mesh, V_mesh, H_display,
+                         cmap='viridis', shading='flat',
+                         alpha=0.75, zorder=15, rasterized=True)
+
+    # ── 理论 UV 轨迹（置于密度图下层）──
     for bl_idx in range(n_baselines):
         u_track = uv_lines[bl_idx, :, 0]
         v_track = uv_lines[bl_idx, :, 1]
@@ -802,11 +1613,9 @@ def _draw_uv_coverage_subplot(ax_uv, antennas, freq_mhz, data_dir=None,
     ax_uv.axvline(x=0, color='#336699', linewidth=0.5, alpha=0.5)
 
     # ── 自适应坐标范围 ──
-    uv_max = max(np.max(np.abs(uv_lines[:, 0, :])),
-                 np.max(np.abs(uv_lines[:, -1, :]))) * 1.15
-    if accumulated_uv is not None and len(accumulated_uv) > 0:
-        all_uv_max = max(np.max(np.abs(all_u)), np.max(np.abs(all_v))) * 1.15
-        uv_max = max(uv_max, all_uv_max)
+    theory_max = max(np.max(np.abs(uv_lines[:, 0, :])),
+                     np.max(np.abs(uv_lines[:, -1, :]))) * 1.15
+    uv_max = max(theory_max, uv_data_lim)
     if uv_max > 0:
         ax_uv.set_xlim(-uv_max, uv_max)
         ax_uv.set_ylim(-uv_max, uv_max)
@@ -819,10 +1628,11 @@ def _draw_uv_coverage_subplot(ax_uv, antennas, freq_mhz, data_dir=None,
         Line2D([0], [0], linestyle='--', color='#ff8c42', linewidth=0.8,
                label='(−u,−v) conjugate'),
     ]
-    if accumulated_uv is not None and len(accumulated_uv) > 0:
+    if total_uv_samples > 0:
         legend_elements.insert(0, Line2D(
-            [0], [0], marker='o', color='w', markerfacecolor='#00ccff',
-            markersize=4, label=f'Integrated UV ({len(accumulated_uv)} samples)'
+            [0], [0], marker='s', color='w',
+            markerfacecolor=plt.cm.viridis(0.6), markersize=8,
+            label=f'UV density ({n_total:,} pts, {uv_bins}×{uv_bins} bins)'
         ))
     ax_uv.legend(handles=legend_elements, loc='upper right',
                  fontsize=5.5, facecolor='#16213e',
@@ -876,13 +1686,13 @@ def main():
                         help='Observing frequency in MHz (default: 150)')
     parser.add_argument('--fov', type=float, default=180.0,
                         help='Field of view in degrees (default: 180 for all-sky)')
-    parser.add_argument('--grid', type=int, default=256,
-                        help='Image grid points (default: 256)')
+    parser.add_argument('--grid', type=int, default=512,
+                        help='Image grid points (default: 512)')
     parser.add_argument('--antennas', default='optimized_antenna_coordinates.txt',
                         help='Antenna coordinate file')
-    parser.add_argument('--nch', type=int, default=40,
-                        help='Number of broadband frequency channels (default: 40, '
-                             '1 = single-channel legacy mode)')
+    parser.add_argument('--nch', type=int, default=0,
+                        help='Number of broadband frequency channels '
+                             '(0=全部4096个, >0=均匀降采样; default: 0)')
     parser.add_argument('--mode', choices=['cpu', 'gpu', 'polar_cpu'],
                         default='polar_cpu',
                         help='Imaging mode: cpu (Cartesian), gpu (Polar GPU), '
@@ -890,20 +1700,64 @@ def main():
     parser.add_argument('--method', choices=['snapshot', 'tracked', 'both'],
                         default='both',
                         help='Integration method (default: both)')
-    parser.add_argument('--lat', type=float, default=40.0,
-                        help='Observer latitude in degrees (default: 40)')
-    parser.add_argument('--lon', type=float, default=116.0,
-                        help='Observer longitude in degrees (default: 116)')
+    parser.add_argument('--lat', type=float, default=None,
+                        help='Observer latitude in degrees (reads from observer_location.txt if not set)')
+    parser.add_argument('--lon', type=float, default=None,
+                        help='Observer longitude in degrees (reads from observer_location.txt if not set)')
+    parser.add_argument('--utc-offset', type=float, default=None,
+                        help='Local→UTC timezone offset in hours. '
+                             'E.g. 8 for CST (China). Default: auto-estimate from '
+                             'longitude (lon/15 rounded), but this is approximate. '
+                             'Pass 0 if timestamps are already UTC.')
     parser.add_argument('--output', default='integrated_images',
                         help='Output directory (default: integrated_images)')
-    parser.add_argument('--scale', choices=['linear', 'log'], default='linear',
-                        help='Display scale: linear or log (default: linear)')
-    parser.add_argument('--subtract-baseline', action='store_true',
-                        help='Subtract baseline (uniform-sky response) from dirty image')
+    parser.add_argument('--scale', choices=['linear', 'log'], default='log',
+                        help='Display scale: linear or log (default: log)')
+    parser.add_argument('--no-subtract-baseline', action='store_false',
+                        dest='subtract_baseline',
+                        help='Disable baseline subtraction (enabled by default)')
     parser.add_argument('--no-rfi', action='store_true',
                         help='Disable RFI filtering')
+    parser.add_argument('--rfi-sigma', type=float, default=2.0,
+                        help='Per-frame MAD sigma threshold for RFI rejection '
+                             '(lower = more aggressive, default: 2.0)')
+    parser.add_argument('--rfi-time-sigma', type=float, default=4.0,
+                        help='Time-domain MAD sigma for inter-frame outlier '
+                             'rejection (default: 4.0, 0 = disable)')
+    parser.add_argument('--max-frames', type=int, default=0,
+                        help='Only use the last N frames (0 = all, for quick testing)')
+    parser.add_argument('--gpu', action='store_true', default=False,
+                        help='Enable GPU (CuPy) acceleration for Fourier summation '
+                             '(requires cupy and CUDA-capable GPU)')
+    parser.add_argument('--gpu-device', type=int, default=None,
+                        help='GPU device ID (default: auto-select NVIDIA GPU). '
+                             'Use -1 to list available devices and exit.')
+    parser.add_argument('--workers', type=int, default=1,
+                        help='Number of parallel CPU workers for frame processing '
+                             '(default: 1 = serial; set to 0 for auto = cpu_count//2)')
 
     args = parser.parse_args()
+
+    # ── 解析观测地点经纬度 ──
+    file_lat, file_lon = load_observer_location()
+    if args.lat is not None:
+        observer_lat = args.lat
+    elif file_lat is not None:
+        observer_lat = file_lat
+    else:
+        observer_lat = 40.0  # 旧默认值回退
+    if args.lon is not None:
+        observer_lon = args.lon
+    elif file_lon is not None:
+        observer_lon = file_lon
+    else:
+        observer_lon = 116.0  # 旧默认值回退
+
+    # ── 确定 UTC 偏移（用于太阳位置计算） ──
+    if args.utc_offset is not None:
+        utc_offset = args.utc_offset
+    else:
+        utc_offset = _estimate_utc_offset_from_lon(observer_lon)
 
     # ── 扫描 frames ──
     print("=" * 65)
@@ -925,6 +1779,14 @@ def main():
         date_str = args.date
 
     frames_by_ts = by_date[date_str]
+
+    # 只取最后 N 帧（快速测试模式）
+    if args.max_frames > 0:
+        sorted_ts = sorted(frames_by_ts.keys())
+        keep_ts = set(sorted_ts[-args.max_frames:])
+        frames_by_ts = {ts: frames_by_ts[ts] for ts in sorted_ts if ts in keep_ts}
+        print(f"\n[QUICK-TEST] Using only last {len(frames_by_ts)}/{len(sorted_ts)} frames")
+
     n_frames = len(frames_by_ts)
     print(f"Date: {date_str}")
     print(f"Frames: {n_frames}")
@@ -932,12 +1794,70 @@ def main():
     print(f"FOV: {args.fov}°")
     print(f"Grid: {args.grid}×{args.grid}")
     print(f"Mode: {args.mode}")
-    print(f"RFI filter: {'OFF' if args.no_rfi else 'ON'}")
+    print(f"RFI filter: {'OFF' if args.no_rfi else 'ON'} (sigma={args.rfi_sigma}, time-sigma={args.rfi_time_sigma})")
     print(f"Baseline subtraction: {'ON' if args.subtract_baseline else 'OFF'}")
     print(f"Display scale: {args.scale}")
+    print(f"Observer: lat={observer_lat:.4f}°, lon={observer_lon:.4f}°")
+    if utc_offset != 0:
+        print(f"UTC offset: +{utc_offset}h (timestamps are local time)")
+    else:
+        print(f"UTC offset: 0 (timestamps are UTC)")
+
+    # ── CPU workers ──
+    n_workers = args.workers
+    if n_workers == 0:
+        n_workers = max(1, os.cpu_count() // 2)  # auto: 一半核心
+    if n_workers > 1:
+        # 多进程模式下避免 OpenMP 嵌套并行导致过度订阅
+        os.environ.setdefault('OMP_NUM_THREADS', '1')
+
+    # ── GPU 设备选择 ──
+    if args.gpu and args.gpu_device is not None:
+        if args.gpu_device == -1:
+            # 列出可用 GPU 并退出
+            if _GPU_AVAILABLE and _cp is not None:
+                n = _cp.cuda.runtime.getDeviceCount()
+                print(f"\nAvailable CUDA devices ({n}):")
+                for i in range(n):
+                    props = _cp.cuda.runtime.getDeviceProperties(i)
+                    name = props["name"].decode()
+                    mem = props["totalGlobalMem"] // 1024 // 1024
+                    current = " ← current" if i == _GPU_DEVICE_ID else ""
+                    print(f"  [{i}] {name}  ({mem} MB){current}")
+            else:
+                print("\n[ERROR] CuPy not available — no CUDA devices found")
+            sys.exit(0)
+        elif args.gpu_device != _GPU_DEVICE_ID:
+            if _GPU_AVAILABLE and _cp is not None:
+                try:
+                    _cp.cuda.Device(args.gpu_device).use()
+                    _GPU_DEVICE_ID = args.gpu_device
+                    props = _cp.cuda.runtime.getDeviceProperties(args.gpu_device)
+                    print(f"  [GPU] Selected device {args.gpu_device}: "
+                          f"{props['name'].decode()}")
+                except Exception as e:
+                    print(f"  [WARN] Cannot use GPU device {args.gpu_device}: {e}")
+                    print(f"  [WARN] Falling back to device {_GPU_DEVICE_ID}")
+    elif args.gpu and _GPU_AVAILABLE and _cp is not None:
+        try:
+            props = _cp.cuda.runtime.getDeviceProperties(_GPU_DEVICE_ID)
+            print(f"  [GPU] Auto-selected: {props['name'].decode()} "
+                  f"(device {_GPU_DEVICE_ID})")
+        except Exception:
+            pass
 
     filter_rfi = not args.no_rfi
     apply_w_correction = True
+
+    # ── 时域 RFI 标记（跨帧异常检测）──
+    rfi_time_flags = {}
+    if filter_rfi and args.rfi_time_sigma > 0:
+        print(f"\n--- Time-domain RFI pre-scan ---")
+        rfi_time_flags = filter_rfi_time_domain(
+            frames_by_ts, args.freq, n_channels=args.nch,
+            sigma=args.rfi_time_sigma, window=31, verbose=True
+        )
+
     total_start = time.time()
 
     # ── 执行积分 ──
@@ -955,14 +1875,22 @@ def main():
                 frames_by_ts, args.freq, args.grid, args.fov,
                 args.antennas, filter_rfi, apply_w_correction, args.mode,
                 n_channels=args.nch,
-                subtract_baseline=args.subtract_baseline
+                subtract_baseline=args.subtract_baseline,
+                rfi_sigma=args.rfi_sigma,
+                rfi_time_flags=rfi_time_flags,
             )
         else:
             dirty, acc_uv = integrate_tracked(
                 frames_by_ts, args.freq, args.grid, args.fov,
                 args.antennas, filter_rfi, apply_w_correction, args.mode,
-                longitude_deg=args.lon, n_channels=args.nch,
-                subtract_baseline=args.subtract_baseline
+                longitude_deg=observer_lon, latitude_deg=observer_lat,
+                n_channels=args.nch,
+                subtract_baseline=args.subtract_baseline,
+                rfi_sigma=args.rfi_sigma,
+                rfi_time_flags=rfi_time_flags,
+                utc_offset_hours=utc_offset,
+                use_gpu=args.gpu,
+                n_workers=n_workers,
             )
 
         if dirty is not None:
@@ -973,6 +1901,15 @@ def main():
         print("\n[ERROR] No integration results produced!")
         sys.exit(1)
 
+    # ── 计算太阳轨迹 ──
+    print(f"\n--- Computing Sun trajectory ---")
+    all_timestamps = sorted(frames_by_ts.keys())
+    sun_traj = compute_sun_trajectory(
+        all_timestamps, observer_lat, observer_lon,
+        subsample=120, utc_offset_hours=utc_offset,
+        verbose=True
+    )
+
     # ── 保存 ──
     for method, dirty in results.items():
         save_integrated_image(
@@ -982,7 +1919,10 @@ def main():
             n_channels=args.nch,
             scale=args.scale,
             accumulated_uv=uv_data.get(method),
-            subtract_baseline=args.subtract_baseline
+            subtract_baseline=args.subtract_baseline,
+            observer_lat=observer_lat,
+            observer_lon=observer_lon,
+            sun_trajectory=sun_traj,
         )
 
     total_elapsed = time.time() - total_start

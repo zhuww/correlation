@@ -1021,8 +1021,8 @@ def main():
     parser.add_argument('--no-save', action='store_true',
                         help='Disable automatic PNG saving')
     parser.add_argument('--nch', type=int, default=10,
-                        help='Number of broadband frequency channels (default: 10, '
-                             '1 = legacy single-channel)')
+                        help='Number of broadband frequency channels '
+                             '(0=全4096通道较慢, 10=实时默认, 1=单通道)')
     parser.add_argument('--mode', choices=['cpu', 'gpu', 'polar_cpu'], default='cpu',
                         help='Imaging mode: cpu (Cartesian l,m), gpu (Polar CuPy), polar_cpu (Polar C/OpenMP)')
     parser.add_argument('--scale', choices=['linear', 'log'], default='linear',
