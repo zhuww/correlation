@@ -5,6 +5,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--rms-norm', action='store_true', help='启用 RMS 归一化')
 parser.add_argument('--n-components', type=int, default=20, help='CPCA 成分数')
 parser.add_argument('--date', default='20260630', help='数据日期')
+parser.add_argument('--start-time', default=None, help='开始时间 (HHMMSS)')
 parser.add_argument('--ds-time', type=int, default=16, help='时间降采样因子')
 parser.add_argument('--ds-freq', type=int, default=16, help='频率降采样因子')
 parser.add_argument('--skip-pca', action='store_true', help='跳过 CPCA')
@@ -25,6 +26,8 @@ def run_one(ant_a, ant_b, rms):
            "--date", args_cli.date,
            "--ds-time", str(args_cli.ds_time),
            "--ds-freq", str(args_cli.ds_freq)] + extra
+    if args_cli.start_time:
+        cmd += ["--start-time", args_cli.start_time]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
     out = proc.stdout + proc.stderr
 
@@ -50,7 +53,8 @@ mode = "RMS归一化 + " if rms_flag else ""
 K = args_cli.n_components
 ds_info = f"ds={args_cli.ds_time}x{args_cli.ds_freq}"
 pca_mode = "skip-CPCA" if args_cli.skip_pca else f"CPCA_K{K}"
-print(f"[{args_cli.date}] {ds_info} {mode}{pca_mode} 批量测试")
+time_info = f" from={args_cli.start_time}" if args_cli.start_time else ""
+print(f"[{args_cli.date}{time_info}] {ds_info} {mode}{pca_mode} 批量测试")
 print(f"{'基线':>10}  {'RFI%':>7}  {'对角%':>7}  {'横纵%':>7}  {'CPCA保留%':>10}  {'fringe周期':>12}")
 print("-" * 82)
 

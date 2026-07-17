@@ -247,6 +247,8 @@ def main():
     parser = argparse.ArgumentParser(
         description='短基线 fringe: 中位数+PCA → 复数降采样 → 实部找条纹')
     parser.add_argument('--date', default='20260630')
+    parser.add_argument('--start-time', default=None,
+                        help='开始时间 (HHMMSS), 从此时间起处理连续时间段')
     parser.add_argument('--max-frames', type=int, default=0)
     parser.add_argument('--n-channels', type=int, default=4096)
     parser.add_argument('--center-freq', type=float, default=150.0)
@@ -285,6 +287,17 @@ def main():
     all_data = discover_frames(watch_dir, args.date)
     frames_by_ts = all_data[args.date]
     timestamps = list(frames_by_ts.keys())
+
+    # 按开始时间过滤: 只保留 >= start-time 的时间戳 (连续时间段)
+    if args.start_time:
+        # timestamps 格式: YYYYMMDD_HHMMSS
+        filtered = [ts for ts in timestamps if ts[9:] >= args.start_time]
+        if not filtered:
+            print(f"  错误: 日期 {args.date} 没有 >= {args.start_time} 的数据")
+            sys.exit(1)
+        first_ts = filtered[0]
+        print(f"  从 {first_ts[9:]} 开始 (跳过前 {len(timestamps)-len(filtered)} 帧)")
+        timestamps = filtered
     if args.max_frames > 0:
         timestamps = timestamps[:args.max_frames]
     n_frames = len(timestamps)
